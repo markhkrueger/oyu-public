@@ -1,7 +1,7 @@
 "strict";
 
 import { createServer, IncomingMessage, ServerResponse, Server } from "http";
-import { parse as parseUrl } from "url";
+// url module no longer used — replaced by WHATWG URL API
 import {
     appendFileSync, readFileSync, writeFileSync, existsSync,
     renameSync, readdirSync, unlinkSync, statSync, mkdirSync
@@ -3054,7 +3054,7 @@ function buildDashboardHtml(status: StatusResponse, stats?: StatsSnapshot, ledMo
 <body>
 <h1>${L("heading", { version: VERSION })}</h1>
 ${cardsHtml}
-<div class="footer"><a href="https://github.com/markhkrueger/oyu">github.com/markhkrueger/oyu</a></div>
+<div class="footer"><a href="https://github.com/markhkrueger/oyu-public">github.com/markhkrueger/oyu-public</a></div>
 <script>
 function togglePump() {
   var btn = document.querySelector("#card-pump .btn");
@@ -5168,6 +5168,7 @@ class FlowHttpServer {
     private networkStatus: NetworkStatus = new NetworkStatus();
     private cachedNetworkInfo: NetworkInfo | undefined;
     private networkPollTimer: ReturnType<typeof setInterval> | undefined;
+    private networkPollInFlight: Promise<void> | undefined;
     public readonly accessPoint: AccessPoint = new AccessPoint();
     /** Number of consecutive polls with no usable network. */
     private noNetworkCount = 0;
@@ -5202,10 +5203,14 @@ class FlowHttpServer {
         });
     }
 
-    public stop(): Promise<void> {
+    public async stop(): Promise<void> {
         if (this.networkPollTimer) {
             clearInterval(this.networkPollTimer);
             this.networkPollTimer = undefined;
+        }
+        if (this.networkPollInFlight) {
+            await this.networkPollInFlight;
+            this.networkPollInFlight = undefined;
         }
         this.accessPoint.stop();
         return new Promise((resolve) => {
@@ -5221,7 +5226,7 @@ class FlowHttpServer {
     }
 
     private pollNetwork(): void {
-        this.networkStatus.getNetworkDetails().then((info) => {
+        const p = this.networkStatus.getNetworkDetails().then((info) => {
             const prev = this.cachedNetworkInfo;
             this.cachedNetworkInfo = info;
 
@@ -5284,6 +5289,7 @@ class FlowHttpServer {
         }).catch((err) => {
             logger.logError(LogSeverity.Important, LogArea.Server, err as Error, "network poll failed");
         });
+        this.networkPollInFlight = p;
     }
 
     public get address(): { port: number } | undefined {
@@ -5295,8 +5301,8 @@ class FlowHttpServer {
     }
 
     private handleRequest(req: IncomingMessage, res: ServerResponse): void {
-        const parsed = parseUrl(req.url || "/", true);
-        const path = parsed.pathname || "/";
+        const parsed = new URL(req.url || "/", "http://localhost");
+        const path = parsed.pathname;
 
         logger.log(LogSeverity.Detail, LogArea.Server, `${req.method} ${path}`);
 
@@ -5375,8 +5381,8 @@ class FlowHttpServer {
                 break;
 
             case "/temperature": {
-                const sensorParam = parsed.query.sensor;
-                if (sensorParam !== undefined) {
+                const sensorParam = parsed.searchParams.get("sensor");
+                if (sensorParam !== null) {
                     const sensorIndex = parseInt(sensorParam as string, 10);
                     if (isNaN(sensorIndex)) {
                         this.sendJson(res, 400, { error: "sensor parameter must be an integer" });
@@ -5419,8 +5425,8 @@ class FlowHttpServer {
                 break;
 
             case "/calendar": {
-                const dateParam = parsed.query.date as string | undefined;
-                const viewParam = parsed.query.view as string | undefined;
+                const dateParam = parsed.searchParams.get("date") ?? undefined;
+                const viewParam = parsed.searchParams.get("view") ?? undefined;
                 const todayStr = dateString();
                 const allDays = this.sensors.historyStore.getAllDays();
                 const oldestDate = allDays.length > 0 ? allDays[0].date : todayStr;
