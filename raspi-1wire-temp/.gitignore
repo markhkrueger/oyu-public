@@ -1,0 +1,15 @@
+# Directories.
+.idea/
+.nyc_output/
+node_modules/
+lcov-report/
+
+
+# Files.
+coverage.json
+lcov.info
+npm-debug.log
+
+# Wildcards.
+isolate-0x**.log
+

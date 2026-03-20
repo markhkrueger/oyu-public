@@ -1,0 +1,21 @@
+{
+    "compilerOptions": {
+      "target": "es6",
+      "lib": ["es2017"],
+      "module": "commonjs",
+      "outDir": "out",
+      "sourceMap": true,
+      "skipLibCheck": true,
+      "plugins": [
+        {
+          "name": "typescript-eslint-plugin",
+          "alwaysShowRuleFailuresAsWarnings": false,
+          "ignoreDefinitionFiles": true,
+          "configFile": "./tslint.json",
+          "suppressWhileTypeErrorsPresent": false,
+          "eslint.validate": ["typescript", "typescriptreact"]
+        }
+      ]
+  },
+  "exclude": ["deprecated", "out", "node_modules"]
+}

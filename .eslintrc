@@ -1,0 +1,14 @@
+{
+    "parser": "@typescript-eslint/parser",
+    "plugins": ["@typescript-eslint"],
+    "rules": {
+      "semi": ["error", "always"],
+      "array-type": true,
+      "no-explicit-any": true,
+      "no-require-imports": true,
+      "no-unsafe-call": true,
+      "no-unsafe-return": true,
+      "prefer-readonly": true,
+      "switch-exhaustiveness-check": true
+    }
+  }

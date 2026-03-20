@@ -1,0 +1,41 @@
+
+# Directories
+.idea/
+.nyc_output/
+node_modules/
+lcov-report/
+out/
+pyt/
+
+# Files
+coverage.json
+lcov.info
+npm-debug.log
+package-lock.json
+pnpm-lock.yaml
+
+# Wildcards
+isolate-0x*.log
+isolate-0x*.log.zip
+
+# Data backups
+oyu_data-back*.json
+oyu_data-back*.json.zip
+
+# Secrets
+wifi_passwords.json
+oyu_settings.json
+
+# Runtime data
+acc.json
+flow_history.json
+oyu_data.json
+persist/
+flow_*.log
+
+# System
+.DS_Store
+
+# Misc
+*.zip
+p.txt

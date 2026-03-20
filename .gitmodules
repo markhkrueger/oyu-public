@@ -1,0 +1,3 @@
+[submodule "raspi-1wire-temp"]
+	path = raspi-1wire-temp
+	url = ./raspi-1wire-temp/

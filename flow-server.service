@@ -1,0 +1,26 @@
+# OYU Flow Server systemd unit
+#
+# Install:
+#   sudo cp flow-server.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable flow-server
+#   sudo systemctl start flow-server
+#
+# Useful commands:
+#   sudo systemctl status flow-server    # check if running
+#   journalctl -u flow-server -f         # tail logs
+#   sudo systemctl restart flow-server   # manual restart
+
+[Unit]
+Description=OYU Flow Server
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/node /home/<your-user>/flow/flow_server.js -s
+WorkingDirectory=/home/<your-user>/flow
+Restart=on-failure
+RestartSec=5
+User=<your-user>
+
+[Install]
+WantedBy=multi-user.target

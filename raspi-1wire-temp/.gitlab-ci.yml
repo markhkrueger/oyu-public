@@ -1,0 +1,31 @@
+image: node:latest
+
+include:
+  - template: Dependency-Scanning.gitlab-ci.yml
+  - template: License-Scanning.gitlab-ci.yml
+  - template: SAST.gitlab-ci.yml
+
+# This is a reusable script block rather than a normal "before_script" directive
+# because the commands in here will not work in the Security & Compliance
+# templates.  Those do not use Debian or Ubuntu based images, the "apt" command
+# does not exist in those images.
+.before_script: &before_script
+  - node --version
+  - npm --version
+  - npm install
+
+test:
+  stage: test
+  before_script:
+    - *before_script
+  script:
+    - npm install
+    - npm run test
+
+code_coverage:
+  before_script:
+    - *before_script
+  script:
+    - npm install
+    - npm run coverage
+    - curl -s https://codecov.io/bash | bash -s --

@@ -1,0 +1,57 @@
+# ==============================================================================
+#
+# Here I am using the APPVEYOR_BUILD_WORKER_IMAGE "tweak" environment variable
+# so that we can run CI on multiple OSes.  For added test combinations, each OS
+# will run a different version of Python.
+#
+# Currently, only MacOS and Windows are tested on AppVeyor as their
+# Ubuntu/Python is fucked up and it's not easy to run a specific version of
+# Python, let alone try to find the associated version of Pip.  In the mean time
+# Linux builds will continue to be tested with the Gitlab CI runners.
+#
+# Image "tweak":
+#   https://www.appveyor.com/docs/build-environment/#using-multiple-images-for-the-same-build)
+#
+# CI on Linux:
+#   https://www.appveyor.com/docs/linux-images-software/#python
+#
+# CI on Mac OS:
+#   https://www.appveyor.com/docs/macos-images-software/#python
+#
+# CI on Windows:
+#   https://www.appveyor.com/docs/windows-images-software/#python
+#
+# Build stages for YML script:
+#   https://www.appveyor.com/docs/build-configuration/
+#
+# ==============================================================================
+
+environment:
+
+  matrix:
+
+    - APPVEYOR_BUILD_WORKER_IMAGE: macOS
+      APPVEYOR_YML_DISABLE_PS_LINUX: true
+
+    - APPVEYOR_BUILD_WORKER_IMAGE: Visual Studio 2019
+
+build: off
+
+install:
+
+  - ps: >-
+      Get-ChildItem Env: | Sort Name;
+      Install-Product node $env:nodejs_version;
+      & node --version;
+      & npm --version;
+      & npm install 2>&1;
+      $Env:LastExitCode;
+
+  - sh: >-
+      env | sort;
+      node --version;
+      npm --version;
+      npm install;
+
+test_script:
+  - npm run test
