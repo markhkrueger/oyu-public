@@ -20,7 +20,7 @@ GPIO Pinout
 |                 |          |  27   |  28   |          |                   |
 |                 |          |  29   |  30   |          |                   |
 |                 |          |  31   |  32   | GPIO 12  | Flow              |
-|                 |          |  33   |  34   | GND      |                   |
+| HC12-SET        | GPIO 13  |  33   |  34   | GND      |                   |
 |                 |          |  35   |  36   | GPIO 16  | Heater sensor     |
 | Pump            | GPIO 26  |  37   |  38   |          |                   |
 |                 | GND      |  39   |  40   |          |                   |

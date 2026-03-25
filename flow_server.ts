@@ -6532,11 +6532,16 @@ async function main(args: string[]): Promise<void> {
                         || err.stack?.includes("ciao"));
                 if (isCiao) {
                     logger.log(LogSeverity.Info, LogArea.Server,
-                        `suppressed ciao exception: ${err.message}`);
+                        `suppressed ciao exception: ${err.message} — restarting in 2s`);
                     try {
                         appendFileSync(sensors.activityLogger.logPath,
-                            `${timeString(Date.now())} :[Info](SERVER) suppressed ciao exception: ${err.message}\n`);
+                            `${timeString(Date.now())} :[Info](SERVER) suppressed ciao exception: ${err.message} — restarting in 2s\n`);
                     } catch { /* best effort */ }
+                    // ciao is left in a broken state — restart cleanly so systemd brings it back healthy
+                    setTimeout(() => {
+                        sensors.stop();
+                        process.exit(0);
+                    }, 2000);
                     return;
                 }
                 logger.logError(LogSeverity.Severe, LogArea.General, err,
@@ -6560,11 +6565,16 @@ async function main(args: string[]): Promise<void> {
                             || err.message.includes("Netmask cannot have a version")));
                 if (isCiao) {
                     logger.log(LogSeverity.Info, LogArea.Server,
-                        `suppressed ciao rejection: ${err.message}`);
+                        `suppressed ciao rejection: ${err.message} — restarting in 2s`);
                     try {
                         appendFileSync(sensors.activityLogger.logPath,
-                            `${timeString(Date.now())} :[Info](SERVER) suppressed ciao rejection: ${err.message}\n`);
+                            `${timeString(Date.now())} :[Info](SERVER) suppressed ciao rejection: ${err.message} — restarting in 2s\n`);
                     } catch { /* best effort */ }
+                    // ciao is left in a broken state — restart cleanly so systemd brings it back healthy
+                    setTimeout(() => {
+                        sensors.stop();
+                        process.exit(0);
+                    }, 2000);
                     return;
                 }
                 logger.logError(LogSeverity.Severe, LogArea.General, err,
