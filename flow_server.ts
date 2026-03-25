@@ -35,13 +35,14 @@ Endpoints:
 
 */
 
-const VERSION = "1.0.7";
+const VERSION = "1.0.8";
 
 // ---- Constants ----
 
+const MINUTE_SECONDS = 60;
 const SECOND = 1000;
-const MINUTE = 60 * SECOND;
-const HOUR = 60 * MINUTE;
+const MINUTE = MINUTE_SECONDS * SECOND;
+const HOUR = MINUTE_SECONDS * MINUTE;
 
 const CONFIG_FILE = "flow_config.json";
 
@@ -57,11 +58,12 @@ let SENSOR_PIN = 12;      // BCM 12, pin 32 — flow sensor input
 let LOOPBACK_OUT_PIN = 24; // BCM 24, pin 18 — loopback output (permanently jumpered)
 let LOOPBACK_IN_PIN = 23;  // BCM 23, pin 16 — loopback input (permanently jumpered)
 let PUMP_PIN = 26;        // BCM 26, pin 37 — pump relay output
-
+let HC12_SET_PIN = 13;    // BCM 13, pin 33 — HC12 SET pin
 let HOT_LED_PIN = 22;     // BCM 22, pin 15 — HOT temperature LED
 let FLOW_LED_PIN = 27;    // BCM 27, pin 13 — flow status LED
 let PUMP_LED_PIN = 17;    // BCM 17, pin 11 — pump status LED
 const HOT_LED_THRESHOLD = 40; // degrees C
+let HC12_SERIAL_CHANNEL = 1;   // HC12 channel
 
 let PUMP_WATTS = 0;           // pump power in watts (0 = not configured)
 let HEATER_WATTS = 0;         // water heater power in watts (0 = not configured)
@@ -77,6 +79,7 @@ let HOMEKIT_PIN = "000-00-000";
 let HOMEKIT_PORT = 47128;
 let HOMEKIT_USERNAME = "00:00:00:00:00:00";
 
+const DOOR_STILL_OPEN_THRESHOLD = 30; // seconds
 let DOOR_MONITOR_ENABLED = false;
 let DOOR_NAMES: Record<string, string> = {};  // door ID "0"-"9" → display name
 
@@ -105,6 +108,8 @@ interface FlowConfig {
     flowStopDelay?: number;
     pumpMaxRunTime?: number;
     sensorPin?: number;
+    hc12SetPin?: number;
+    hc12SerialChannel?: number;
     pumpPin?: number;
     logFile?: string;
     historyFile?: string;
@@ -152,6 +157,8 @@ function applyConfig(cfg: FlowConfig): void {
     if (cfg.flowStopDelay !== undefined) { FLOW_STOP_DELAY = cfg.flowStopDelay * SECOND; }
     if (cfg.pumpMaxRunTime !== undefined) { PUMP_MAX_RUN_TIME = cfg.pumpMaxRunTime * MINUTE; }
     if (cfg.sensorPin !== undefined) { SENSOR_PIN = cfg.sensorPin; }
+    if (cfg.hc12SetPin !== undefined) { HC12_SET_PIN = cfg.hc12SetPin; }
+    if (cfg.hc12SerialChannel !== undefined) { HC12_SERIAL_CHANNEL = cfg.hc12SerialChannel; }
     if (cfg.pumpPin !== undefined) { PUMP_PIN = cfg.pumpPin; }
     if (cfg.logFile !== undefined) { LOG_FILE = cfg.logFile; }
     if (cfg.historyFile !== undefined) { HISTORY_FILE = cfg.historyFile; }
@@ -279,6 +286,8 @@ const DEFAULT_LOCALE: LocaleStrings = {
     wifiTurnOff: "Turn off Wi-Fi",
     wifiTurnOn: "Turn on Wi-Fi",
     wifiOff: "Wi-Fi is turned off. Connected via Ethernet.",
+    doors: "Doors", doorNoEvents: "No door events",
+    doorOpenDuration: "open {duration}", doorStillOpen: "still open",
     restart: "Restart",
     restartConfirm: "Restart the system? The dashboard will be unavailable for a few seconds.",
     restartMessage: "Restarting...",
@@ -367,12 +376,21 @@ function sensorDisplayName(role: string): string {
 
 // ---- Interfaces ----
 
+interface DoorState {
+    doorId: number;
+    name: string;
+    lastOpenTime: number;      // ms timestamp when door last opened (0 = never)
+    lastOpenSeconds: number;   // how long it was open
+    stillOpen: boolean;        // true if door is currently open (no CLOSE received)
+}
+
 interface StatusResponse {
     time: number;
     temperature: { name: string; celsius: number; timeSinceLastChange: number }[];
     flow: { lpm: number; timeSinceLastChange: number };
     pump: { state: boolean; source: "auto" | "user" | undefined; timeSinceLastChange: number };
     heaterActive: boolean;
+    doors: DoorState[];
     stats: StatsSnapshot;
     start: number;
     status: string;
@@ -1048,10 +1066,10 @@ class StatsAccumulator {
         if (existing) {
             this.totalFlowLiters = existing.flowLiters;
             // Use precise seconds if available, otherwise fall back to rounded minutes
-            this.pumpOnSeconds = existing.pumpOnSeconds ?? Math.round(existing.pumpOnMinutes * 60);
+            this.pumpOnSeconds = existing.pumpOnSeconds ?? Math.round(existing.pumpOnMinutes * MINUTE_SECONDS);
             this.heaterOnSeconds = existing.heaterOnSeconds ?? 0;
             this.hotAboveThresholdSeconds = existing.hotAboveThresholdSeconds
-                ?? Math.round((existing.hotAboveThresholdMinutes ?? 0) * 60);
+                ?? Math.round((existing.hotAboveThresholdMinutes ?? 0) * MINUTE_SECONDS);
             // Restore temperature averages so they blend with new readings
             for (const t of existing.avgTemps) {
                 // Use a synthetic count of 1 so the running average merges naturally
@@ -1088,7 +1106,7 @@ class StatsAccumulator {
 
         // Accumulate flow
         if (lpm > 0) {
-            this.totalFlowLiters += lpm / 60; // 1 tick = 1 second
+            this.totalFlowLiters += lpm / MINUTE_SECONDS; // 1 tick = 1 second
         }
 
         // Accumulate pump time
@@ -1144,7 +1162,7 @@ class StatsAccumulator {
 
         // Record timeline point once per minute
         const d = new Date(now);
-        const minute = d.getHours() * 60 + d.getMinutes();
+        const minute = d.getHours() * MINUTE_SECONDS + d.getMinutes();
         if (minute !== this.lastRecordedMinute) {
             const hot = findReadingByRole(temps, "Hot");
             this.timeline.record(minute, hot?.celsius, lpm, heaterActive);
@@ -2068,7 +2086,7 @@ interface DoorEvent {
     doorId: number;
     name: string;
     type: "open" | "close";
-    /** Seconds the door was open (for "open" events), 60 means left open. */
+    /** Seconds the door was open (for "open" events), DOOR_STILL_OPEN_THRESHOLD means left open. */
     openSeconds?: number;
     time: number;
 }
@@ -2081,7 +2099,7 @@ const SERIAL_BAUD = 9600;
  * to the Raspberry Pi UART (RXD/TXD GPIO pins).
  *
  * Protocol: 9600 baud, messages in the format:
- *   "DOORi:OPENss"  — door i opened for ss seconds (60 = left open)
+ *   "DOORi:OPENss"  — door i opened for ss seconds (DOOR_STILL_OPEN_THRESHOLD = left open)
  *   "DOORi:CLOSE"   — door i closed
  */
 class DoorMonitor {
@@ -2104,6 +2122,9 @@ class DoorMonitor {
             return;
         }
 
+        // Configure HC12 channel via AT command mode (SET pin LOW = AT mode)
+        this.configureHC12Channel();
+
         this.serialProcess = spawn("cat", [SERIAL_DEVICE], { stdio: ["ignore", "pipe", "ignore"] });
 
         this.serialProcess.stdout?.on("data", (chunk: Buffer) => {
@@ -2123,7 +2144,55 @@ class DoorMonitor {
         });
 
         logger.log(LogSeverity.Info, LogArea.General,
-            `door monitor started on ${SERIAL_DEVICE} @ ${SERIAL_BAUD} baud`);
+            `door monitor started on ${SERIAL_DEVICE} channel ${HC12_SERIAL_CHANNEL} @ ${SERIAL_BAUD} baud`);
+    }
+
+    /** Set the HC12 wireless module to the configured channel via AT commands.
+     *  Pulls the SET pin LOW to enter AT mode, sends the channel command, then
+     *  releases the pin back to HIGH for normal transparent mode. */
+    private configureHC12Channel(): void {
+        const channel = String(HC12_SERIAL_CHANNEL).padStart(3, "0");
+        let setProc: ReturnType<typeof spawn> | undefined;
+        try {
+            // Pull SET pin LOW to enter AT command mode
+            setProc = spawn("gpioset", ["--chip", "0", `${HC12_SET_PIN}=0`]);
+            // HC12 needs ~40ms to enter AT mode
+            execSync("sleep 0.1", { timeout: 2000 });
+
+            // Send AT channel command; read response with timeout (head blocks until byte count)
+            execSync(`echo -ne "AT+C${channel}\\r\\n" > ${SERIAL_DEVICE}`, { timeout: 2000, stdio: "pipe" });
+            let result = "";
+            try {
+                result = execSync(
+                    `timeout 1 head -c 100 ${SERIAL_DEVICE}`,
+                    { timeout: 3000, stdio: "pipe" },
+                ).toString().trim();
+            } catch (readErr) {
+                // timeout exits 124 when it kills head — capture any partial output
+                const output = (readErr as { stdout?: Buffer }).stdout;
+                if (output) { result = output.toString().trim(); }
+            }
+
+            if (result.includes("OK")) {
+                logger.log(LogSeverity.Info, LogArea.General,
+                    `HC12 set to channel ${HC12_SERIAL_CHANNEL} (${result})`);
+            } else {
+                logger.log(LogSeverity.Important, LogArea.General,
+                    `HC12 channel ${HC12_SERIAL_CHANNEL} response: ${result || "(no response)"}`);
+            }
+        } catch (e) {
+            logger.logError(LogSeverity.Important, LogArea.General, e as Error,
+                `failed to configure HC12 channel ${HC12_SERIAL_CHANNEL}`);
+        } finally {
+            // Kill the LOW holder and drive SET pin HIGH to exit AT mode
+            if (setProc) { setProc.kill(); }
+            try {
+                const highProc = spawn("gpioset", ["--chip", "0", `${HC12_SET_PIN}=1`]);
+                // Wait briefly for the pin to latch, then release
+                execSync("sleep 0.05", { timeout: 2000 });
+                highProc.kill();
+            } catch { /* best effort */ }
+        }
     }
 
     public stop(): void {
@@ -2193,7 +2262,7 @@ class DoorMonitor {
         }
         logger.log(LogSeverity.Info, LogArea.General,
             event.type === "open"
-                ? `${event.name} opened (${event.openSeconds}s${event.openSeconds === 60 ? " — left open" : ""})`
+                ? `${event.name} opened (${event.openSeconds}s${event.openSeconds === DOOR_STILL_OPEN_THRESHOLD ? " — left open" : ""})`
                 : `${event.name} closed`);
         this.onEvent?.(event);
     }
@@ -2249,7 +2318,7 @@ class SensorManager {
         this.pump.onStateChange = (on, source) => {
             this.activityLogger.logPumpChange(on, source);
             const now = new Date();
-            const minute = now.getHours() * 60 + now.getMinutes();
+            const minute = now.getHours() * MINUTE_SECONDS + now.getMinutes();
             this.statsAccumulator.timeline.pumpChanged(on, minute);
             if (this.statusLEDs.mode === "normal") {
                 this.statusLEDs.updatePumpLed(on);
@@ -2315,6 +2384,25 @@ class SensorManager {
     }
 
     public getStatus(): StatusResponse {
+        // Find the most recent open event per door
+        const lastOpen = new Map<number, DoorEvent>();
+        for (const ev of this.doorMonitor.getRecentEvents(500)) {
+            if (ev.type === "open") { lastOpen.set(ev.doorId, ev); }
+        }
+        const doorStates: DoorState[] = this.doorMonitor.getDoorStates().map(d => {
+            const openEv = lastOpen.get(d.doorId);
+            // Door is still open if the latest event is an open at the threshold (no CLOSE followed)
+            const stillOpen = d.lastEvent.type === "open"
+                && d.lastEvent.openSeconds !== undefined
+                && d.lastEvent.openSeconds >= DOOR_STILL_OPEN_THRESHOLD;
+            return {
+                doorId: d.doorId,
+                name: d.name,
+                lastOpenTime: openEv ? openEv.time - (openEv.openSeconds ?? 0) * 1000 : 0,
+                lastOpenSeconds: openEv?.openSeconds ?? 0,
+                stillOpen,
+            };
+        });
         return {
             time: Date.now(),
             temperature: this.temperature.getAllReadings(),
@@ -2328,6 +2416,7 @@ class SensorManager {
                 timeSinceLastChange: this.pump.timeSinceLastChange,
             },
             heaterActive: this.heater.active,
+            doors: doorStates,
             stats: this.getStatsSnapshot(),
             start: this.startTime,
             status: "ok",
@@ -2496,17 +2585,17 @@ class NetworkStatus {
 
 function formatDuration(ms: number): string {
     const secs = Math.floor(ms / 1000);
-    const mins = Math.floor(secs / 60);
-    const hrs = Math.floor(mins / 60);
+    const mins = Math.floor(secs / MINUTE_SECONDS);
+    const hrs = Math.floor(mins / MINUTE_SECONDS);
     const days = Math.floor(hrs / 24);
     if (days > 0) {
-        return `${days}d ${hrs % 24}h ${mins % 60}m`;
+        return `${days}d ${hrs % 24}h ${mins % MINUTE_SECONDS}m`;
     }
     if (hrs > 0) {
-        return `${hrs}h ${mins % 60}m ${secs % 60}s`;
+        return `${hrs}h ${mins % 60}m ${secs % MINUTE_SECONDS}s`;
     }
     if (mins > 0) {
-        return `${mins}m ${secs % 60}s`;
+        return `${mins}m ${secs % MINUTE_SECONDS}s`;
     }
     return `${secs}s`;
 }
@@ -2516,8 +2605,8 @@ function formatDurationHMS(ms: number): string {
     const totalSeconds = Math.floor(ms / 1000);
     const days = Math.floor(totalSeconds / 86400);
     const h = Math.floor((totalSeconds % 86400) / 3600);
-    const m = Math.floor((totalSeconds % 3600) / 60);
-    const s = totalSeconds % 60;
+    const m = Math.floor((totalSeconds % 3600) / MINUTE_SECONDS);
+    const s = totalSeconds % MINUTE_SECONDS;
     const hms = `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
     if (days > 0) {
         return `${days}d ${hms}`;
@@ -2527,22 +2616,22 @@ function formatDurationHMS(ms: number): string {
 
 function formatMinutes(mins: number): string {
     if (mins < 1) {
-        return `${Math.round(mins * 60)}s`;
+        return `${Math.round(mins * MINUTE_SECONDS)}s`;
     }
     if (mins < 60) {
         return `${mins.toFixed(1)}m`;
     }
-    const h = Math.floor(mins / 60);
-    const m = Math.round(mins % 60);
+    const h = Math.floor(mins / MINUTE_SECONDS);
+    const m = Math.round(mins % MINUTE_SECONDS);
     return `${h}h ${m}m`;
 }
 
 /** Long-form time display with no decimals: "1 hour 2 minutes 30 seconds" / "1時間2分30秒" */
 function formatMinutesLong(mins: number): string {
-    const totalSeconds = Math.round(mins * 60);
+    const totalSeconds = Math.round(mins * MINUTE_SECONDS);
     const h = Math.floor(totalSeconds / 3600);
-    const m = Math.floor((totalSeconds % 3600) / 60);
-    const s = totalSeconds % 60;
+    const m = Math.floor((totalSeconds % 3600) / MINUTE_SECONDS);
+    const s = totalSeconds % MINUTE_SECONDS;
     if (h > 0 && m > 0 && s > 0) {
         return L("unitHoursMinutesSeconds", { h: String(h), m: String(m), s: String(s) });
     }
@@ -2579,10 +2668,10 @@ function formatEnergyLong(kwh: number | undefined): string {
 
 /** Format minutes as H:MM:SS, dropping leading zero on hours. */
 function formatTimeHMS(mins: number): string {
-    const totalSeconds = Math.round(mins * 60);
+    const totalSeconds = Math.round(mins * MINUTE_SECONDS);
     const h = Math.floor(totalSeconds / 3600);
-    const m = Math.floor((totalSeconds % 3600) / 60);
-    const s = totalSeconds % 60;
+    const m = Math.floor((totalSeconds % 3600) / MINUTE_SECONDS);
+    const s = totalSeconds % MINUTE_SECONDS;
     if (h > 0) {
         return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
     }
@@ -2853,6 +2942,31 @@ ${buildThermometerSvg(560, 100, hotC, L("thermHot"), "therm-hot")}
 </svg>`;
 }
 
+function buildDoorCardHtml(status: StatusResponse): string {
+    if (status.doors.length === 0) {
+        return `  <div id="card-door" class="card">
+    <h2>${L("doors")}</h2>
+    <table><tr><td class="muted">${L("doorNoEvents")}</td></tr></table>
+  </div>`;
+    }
+    const rows = status.doors.map(d => {
+        if (d.lastOpenTime === 0) {
+            return `<tr><td>${d.name}</td><td class="muted">${L("doorNoEvents")}</td></tr>`;
+        }
+        const timeStr = new Date(d.lastOpenTime).toLocaleTimeString(LOCALE.langCode, { hour: "2-digit", minute: "2-digit" });
+        if (d.stillOpen) {
+            const openFor = formatDuration(status.time - d.lastOpenTime);
+            return `<tr><td>${d.name}</td><td class="val flow-active">${L("doorStillOpen")}</td><td class="muted ago">${timeStr} (${openFor})</td></tr>`;
+        }
+        const duration = L("doorOpenDuration", { duration: `${d.lastOpenSeconds}s` });
+        return `<tr><td>${d.name}</td><td class="val">${timeStr}</td><td class="muted ago">${duration}</td></tr>`;
+    }).join("\n");
+    return `  <div id="card-door" class="card">
+    <h2>${L("doors")}</h2>
+    <table>${rows}</table>
+  </div>`;
+}
+
 /** Build just the cards + uptime bar HTML fragment (used for incremental refresh). */
 function buildDashboardCards(status: StatusResponse, stats?: StatsSnapshot, ledMode?: string,
     homekitQrSvg?: string, errorCondition?: LedErrorCondition): string {
@@ -2993,6 +3107,7 @@ ${isError && errorLabel ? `    <p style="color:#ef4444;font-weight:600;margin-bo
       <tr><td>${ledDot(pumpLedOn)}${L("ledPump")}</td><td class="muted">${pumpLedLabel}</td></tr>
     </table>
   </div>
+${DOOR_MONITOR_ENABLED ? buildDoorCardHtml(status) : ""}
 ${stats ? buildStatsCardHtml(stats) : ""}
 ${homekitQrSvg ? `  <div id="card-homekit" class="card">
     <h2>${L("homekitPairing")}</h2>
@@ -3080,7 +3195,7 @@ function refreshCards() {
   fetch("/api/cards").then(function(r) { return r.text(); }).then(function(html) {
     var tmp = document.createElement("div");
     tmp.innerHTML = html;
-    var ids = ["card-diagram","card-temp","card-flow","card-pump","card-leds","card-stats","card-homekit","bar-uptime"];
+    var ids = ["card-diagram","card-temp","card-flow","card-pump","card-leds","card-door","card-stats","card-homekit","bar-uptime"];
     for (var i = 0; i < ids.length; i++) {
       var fresh = tmp.querySelector("#" + ids[i]);
       var existing = document.getElementById(ids[i]);
@@ -3127,7 +3242,7 @@ function niceStep(range: number, targetTicks: number = 5): number {
 /** Format seconds for axis labels: 30s, 5m, 1.5h. */
 function formatSecondsLabel(secs: number): string {
     if (secs < 120) return `${secs}s`;
-    if (secs < 7200) return `${Math.round(secs / 60)}m`;
+    if (secs < 7200) return `${Math.round(secs / MINUTE_SECONDS)}m`;
     return `${(secs / 3600).toFixed(secs % 3600 === 0 ? 0 : 1)}h`;
 }
 
@@ -3179,12 +3294,12 @@ function buildDayChartSvg(timeline: DayTimeline, nowMinute?: number, summary?: D
             if (m >= iv.startMinute && m < end) { pumpOn = true; break; }
         }
         if (pumpOn) {
-            runPumpSecs += 60;
-            runEnergy += PUMP_WATTS * 60 / 3600000;
+            runPumpSecs += MINUTE_SECONDS;
+            runEnergy += PUMP_WATTS * MINUTE_SECONDS / 3600000;
         }
         const pt = timeline.points[m];
         if (pt && pt.heaterActive) {
-            runEnergy += HEATER_WATTS * 60 / 3600000;
+            runEnergy += HEATER_WATTS * MINUTE_SECONDS / 3600000;
         }
         cumulPumpSecs[m] = runPumpSecs;
         cumulEnergyKwh[m] = runEnergy;
@@ -3317,7 +3432,7 @@ function buildDayChartSvg(timeline: DayTimeline, nowMinute?: number, summary?: D
             svg += `<rect x="${centerX - minBarW / 2}" y="${flowBarY}" width="${minBarW}" height="${barH}" fill="#38bdf8" opacity="0.6"/>\n`;
         }
         if (summary.pumpOnMinutes > 0 || (summary.pumpOnSeconds ?? 0) > 0) {
-            const pumpW = Math.max(minBarW, Math.min(chartW, (summary.pumpOnSeconds ?? summary.pumpOnMinutes * 60) / 1440 * chartW));
+            const pumpW = Math.max(minBarW, Math.min(chartW, (summary.pumpOnSeconds ?? summary.pumpOnMinutes * MINUTE_SECONDS) / 1440 * chartW));
             svg += `<rect x="${centerX - pumpW / 2}" y="${pumpBarY}" width="${pumpW}" height="${barH}" fill="#4ade80" opacity="0.6"/>\n`;
         }
         if (showHeater && (summary.heaterEnergyKwh ?? 0) > 0) {
@@ -3425,7 +3540,7 @@ function buildCalendarDayHtml(timeline: DayTimeline, dateStr: string, isToday: b
     oldestDate: string, latestDate: string, summary?: DaySummary): string {
     const threshDisplay = formatTemp(HOT_LED_THRESHOLD);
     const now = new Date();
-    const nowMinute = isToday ? now.getHours() * 60 + now.getMinutes() : undefined;
+    const nowMinute = isToday ? now.getHours() * MINUTE_SECONDS + now.getMinutes() : undefined;
 
     const hasTimeline = timeline.points.some((p) => p !== undefined);
     const hasData = hasTimeline || summary !== undefined;
@@ -4181,9 +4296,9 @@ function buildSensorSetupHtml(
 ): string {
     const roleOptions = (selected: string | undefined) =>
         [`<option value="">${L("sensorRoleNone")}</option>`,
-         ...VALID_SENSOR_ROLES.map((r) =>
-             `<option value="${r}"${r === selected ? " selected" : ""}>${sensorDisplayName(r)}</option>`
-         )].join("");
+        ...VALID_SENSOR_ROLES.map((r) =>
+            `<option value="${r}"${r === selected ? " selected" : ""}>${sensorDisplayName(r)}</option>`
+        )].join("");
 
     const sensorRows = sensors.map((s) => {
         const currentRole = s.deviceId && sensorConfig ? sensorConfig.sensors[s.deviceId] : undefined;
@@ -6119,8 +6234,7 @@ class HomeKitBridge {
             if (origCb) { origCb(event); }
             const svc = doorServices.get(event.doorId);
             if (!svc) { return; }
-            // "open" with 60s means door left open; "close" or "open" with <60s means closed
-            const isOpen = event.type === "open" && event.openSeconds === 60;
+            const isOpen = event.type === "open" && event.openSeconds === DOOR_STILL_OPEN_THRESHOLD;
             doorOpen.set(event.doorId, isOpen);
             svc.updateCharacteristic(Characteristic.ContactSensorState,
                 isOpen

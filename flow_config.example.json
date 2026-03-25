@@ -7,6 +7,8 @@
     "pumpMaxRunTime": 30,
     "sensorPin": 12,
     "pumpPin": 26,
+    "hc12SetPin": 13,
+    "hc12SerialChannel": 0,
     "logFile": "flow.log",
     "historyFile": "flow_history.json",
     "logMaxRotations": 30,
