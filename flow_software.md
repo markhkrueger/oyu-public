@@ -142,6 +142,24 @@ Key settings:
 - `flowPollInterval` — seconds between flow calculations
 - `pumpMaxRunTime` — maximum minutes the pump can run continuously
 
+## HomeKit Settings
+
+You can change the pairing by editing `flow_config.json`:
+
+- `homekitPin` — Any 8-digit code in the format "XXX-XX-XXX" (e.g. "031-45-154"). Avoid codes that Apple blocks: "000-00-000", "111-11-111", "222-22-222", etc. through "999-99-999", and "123-45-678".
+- `homekitUsername` — A unique MAC-like identifier in the format "XX:XX:XX:XX:XX:XX" (e.g. "0E:AA:CE:DD:01:04"). This identifies your bridge to HomeKit. Changing this is what forces a new pairing — HomeKit treats it as a different device.
+- `homekitPort` — Any unused port (e.g. 47128). Only change this if something else is using the same port.
+
+To force a fresh pairing:
+
+1. Remove the old accessory from the Home app
+2. Change `homekitUsername` to a new value (just change a digit or two)
+3. Optionally change `homekitPin` to your preferred code
+4. Delete the persist directory (where HAP-nodejs stores its keys): `rm -rf ~/.HomeKit-persist` or wherever your persist folder is — check for a `persist/` directory next to `flow_server.ts`
+5. Restart the server
+
+The QR code on the dashboard will update automatically with the new pin.
+
 
 ## Systemd Service
 

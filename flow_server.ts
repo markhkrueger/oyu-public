@@ -2391,15 +2391,21 @@ class SensorManager {
         }
         const doorStates: DoorState[] = this.doorMonitor.getDoorStates().map(d => {
             const openEv = lastOpen.get(d.doorId);
+            const openTime = openEv ? openEv.time - (openEv.openSeconds ?? 0) * 1000 : 0;
             // Door is still open if the latest event is an open at the threshold (no CLOSE followed)
             const stillOpen = d.lastEvent.type === "open"
                 && d.lastEvent.openSeconds !== undefined
                 && d.lastEvent.openSeconds >= DOOR_STILL_OPEN_THRESHOLD;
+            // If closed after being left open, calculate actual duration from open time to close time
+            let lastOpenSeconds = openEv?.openSeconds ?? 0;
+            if (d.lastEvent.type === "close" && openEv && openTime > 0) {
+                lastOpenSeconds = Math.round((d.lastEvent.time - openTime) / 1000);
+            }
             return {
                 doorId: d.doorId,
                 name: d.name,
-                lastOpenTime: openEv ? openEv.time - (openEv.openSeconds ?? 0) * 1000 : 0,
-                lastOpenSeconds: openEv?.openSeconds ?? 0,
+                lastOpenTime: openTime,
+                lastOpenSeconds,
                 stillOpen,
             };
         });
