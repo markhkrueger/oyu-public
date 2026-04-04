@@ -14,11 +14,52 @@ This OS has no desktop, so all setup is done via SSH.
 
 ## 1-Wire Temperature Sensors
 
-DS18B20 temperature sensors use the 1-wire bus on GPIO 4. To enable it, edit `/boot/firmware/config.txt` and add:
+DS18B20 temperature sensors use the 1-wire bus on GPIO 4. To enable it, edit `/boot/firmware/config.txt` and add under `[all]`:
 
     dtoverlay=w1-gpio
+    enable_uart=1
 
-Reboot after making this change. Sensors will appear at `/sys/bus/w1/devices/28-*/w1_slave`.
+The `enable_uart=1` line enables the serial port on GPIO 14 (TXD) and GPIO 15 (RXD) at `/dev/serial0`, used by the HC12 wireless module for the door sensor.
+
+Also disable camera and display auto-detection, which can conflict with the 1-wire overlay. This system runs headless and doesn't use a camera or display, so comment these out:
+
+    #camera_auto_detect=1
+    #display_auto_detect=1
+
+Reboot after making these changes. Verify that sensors are detected:
+
+    ls /sys/bus/w1/devices/28-*
+
+Each sensor appears as a directory named with its unique ID (e.g. `28-3ce6f6488743`). To read a sensor's current temperature:
+
+    cat /sys/bus/w1/devices/28-*/w1_slave
+
+If no `28-*` directories appear, check the following:
+
+1. **Verify the overlay is loaded:**
+
+        dtoverlay -l
+
+    You should see `w1-gpio` in the list. If not, check that `dtoverlay=w1-gpio` is in `/boot/firmware/config.txt` (not `/boot/config.txt` on newer OS versions) and reboot.
+
+2. **Check that the kernel modules are loaded:**
+
+        lsmod | grep w1
+
+    You should see `w1_gpio` and `w1_therm`. If missing, load them manually:
+
+        sudo modprobe w1-gpio
+        sudo modprobe w1-therm
+
+3. **Check wiring:** DS18B20 sensors require a 4.7kΩ pull-up resistor between the data line and 3.3V. Without it, the bus may detect intermittently or not at all.
+
+4. **Check for bus master:** The `/sys/bus/w1/devices/` directory should contain at least a `w1_bus_masterX` entry. If even that is missing, the overlay did not load.
+
+5. **Try specifying the GPIO pin explicitly:**
+
+        dtoverlay=w1-gpio,gpiopin=4
+
+Once the flow server is running, open the dashboard and go to **Settings → Sensor Setup** (or navigate to `/sensor-setup`). This page lists all detected sensors and lets you assign each one a role — **Hot**, **Cold**, or **Ambient**. Only Hot is required. The assignments are saved in `sensor_config.json`.
 
 
 ## Install Node.js (v22 or later)
@@ -47,7 +88,16 @@ The flow server uses `gpiomon` and `gpioset` from the libgpiod package to intera
 
 Create the working directory on the Pi:
 
-    mkdir -p /home/mark/flow
+    mkdir -p ~/flow
+
+
+## Install raspi-1wire-temp (Temperature Sensor Library)
+
+The DS18B20 temperature sensor interface is included as a git submodule. After cloning the repo, initialize and fetch it:
+
+    git submodule update --init
+
+This populates the `raspi-1wire-temp/` directory. The server loads it directly via `require('./raspi-1wire-temp/')` — no separate npm install is needed. The directory is copied to the Pi along with the other files (see below).
 
 
 ## Compile on the Development Machine
@@ -64,19 +114,19 @@ This produces compiled JavaScript in the `out/` directory.
 From the development machine, copy the required files to the Pi using `scp`. Replace `yonopi.local` with your Pi's hostname or IP address:
 
     # Compiled server
-    scp out/flow_server.js pi@yonopi.local:/home/mark/flow/
-
+    scp out/flow_server.js pi@yonopi.local:~/flow/
+    
     # Configuration file
-    scp flow_config.json pi@yonopi.local:/home/mark/flow/
+    scp flow_config.json pi@yonopi.local:~/flow/
 
     # Locale files (directory)
-    scp -r locales pi@yonopi.local:/home/mark/flow/
+    scp -r locales pi@yonopi.local:~/flow/
 
     # Temperature sensor submodule (directory)
-    scp -r raspi-1wire-temp pi@yonopi.local:/home/mark/flow/
+    scp -r raspi-1wire-temp pi@yonopi.local:~/flow/
 
     # Systemd service file
-    scp flow-server.service pi@yonopi.local:/home/mark/flow/
+    scp flow-server.service pi@yonopi.local:~/flow/
 
 The required files on the Pi are:
 
@@ -93,11 +143,11 @@ The required files on the Pi are:
 
 On the Pi, create a `package.json` and install the runtime dependencies:
 
-    cd /home/mark/flow
+    cd ~/flow
 
     npm init -y
 
-    npm install @homebridge/hap-nodejs qrcode systeminformation
+    npm install @homebridge/hap-nodejs qrcode systeminformation glob
 
 These are the npm packages required at runtime by flow_server.js:
 
