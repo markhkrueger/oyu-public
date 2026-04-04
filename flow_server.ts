@@ -288,6 +288,8 @@ const DEFAULT_LOCALE: LocaleStrings = {
     wifiOff: "Wi-Fi is turned off. Connected via Ethernet.",
     doors: "Doors", doorNoEvents: "No door events",
     doorOpenDuration: "open {duration}", doorStillOpen: "still open",
+    log: "Log", logTitle: "System Log", logBackToDashboard: "Back to dashboard",
+    logEmpty: "No log entries.",
     restart: "Restart",
     restartConfirm: "Restart the system? The dashboard will be unavailable for a few seconds.",
     restartMessage: "Restarting...",
@@ -1317,7 +1319,7 @@ class TemperatureSensor {
     public readonly deviceId: string | undefined;
     public onSignificantChange?: (name: string, oldCelsius: number, newCelsius: number) => void;
 
-    constructor(private readonly controller: ControllerIf, private readonly index: number, name?: string, deviceId?: string) {
+    constructor(private readonly controller: ControllerIf, public readonly index: number, name?: string, deviceId?: string) {
         this.name = name || `Sensor ${index}`;
         this.deviceId = deviceId;
     }
@@ -2948,6 +2950,40 @@ ${buildThermometerSvg(560, 100, hotC, L("thermHot"), "therm-hot")}
 </svg>`;
 }
 
+function buildLogHtml(): string {
+    const lines = logger.fullLog(LogSeverity.Detail);
+    const escaped = lines
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+    return `<!DOCTYPE html>
+<html lang="${LOCALE.langCode}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${L("logTitle")}</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+         background: #0f172a; color: #e2e8f0; padding: 24px; }
+  h1 { font-size: 1.4rem; font-weight: 600; margin-bottom: 20px; color: #94a3b8; }
+  .log-container { background: #1e293b; border-radius: 10px; padding: 16px; overflow-x: auto; }
+  pre { font-family: "SF Mono", "Menlo", "Monaco", "Courier New", monospace;
+        font-size: 0.8rem; line-height: 1.5; color: #cbd5e1; white-space: pre-wrap; word-break: break-all; }
+  a { color: #94a3b8; }
+  .footer { margin-top: 16px; }
+</style>
+</head>
+<body>
+<h1>${L("logTitle")}</h1>
+<div class="log-container">
+<pre>${escaped || L("logEmpty")}</pre>
+</div>
+<p class="footer"><a href="/">${L("logBackToDashboard")}</a></p>
+</body>
+</html>`;
+}
+
 function buildDoorCardHtml(status: StatusResponse): string {
     if (status.doors.length === 0) {
         return `  <div id="card-door" class="card">
@@ -3121,7 +3157,7 @@ ${homekitQrSvg ? `  <div id="card-homekit" class="card">
     <p class="muted" style="text-align:center;margin-top:8px">${L("pinLabel", { pin: HOMEKIT_PIN })}</p>
   </div>` : ""}
 </div>
-<div id="bar-uptime" class="uptime">${L("started")} <span>${startDate.toLocaleString(LOCALE.langCode)}</span> &mdash; ${L("uptime")} <span>${uptime}</span> &mdash; <a href="/calendar" style="color:#94a3b8">${L("calendar")}</a> &mdash; <a href="/settings" style="color:#94a3b8">${L("settings")}</a> &mdash; <a href="/wifi" style="color:#94a3b8">${L("wifi")}</a> &mdash; <a href="#" style="color:#94a3b8" onclick="doRestart();return false">${L("restart")}</a></div>`;
+<div id="bar-uptime" class="uptime">${L("started")} <span>${startDate.toLocaleString(LOCALE.langCode)}</span> &mdash; ${L("uptime")} <span>${uptime}</span> &mdash; <a href="/calendar" style="color:#94a3b8">${L("calendar")}</a> &mdash; <a href="/settings" style="color:#94a3b8">${L("settings")}</a> &mdash; <a href="/log" style="color:#94a3b8">${L("log")}</a> &mdash; <a href="/wifi" style="color:#94a3b8">${L("wifi")}</a> &mdash; <a href="#" style="color:#94a3b8" onclick="doRestart();return false">${L("restart")}</a></div>`;
 }
 
 function buildDashboardHtml(status: StatusResponse, stats?: StatsSnapshot, ledMode?: string,
@@ -5529,6 +5565,10 @@ class FlowHttpServer {
                 this.sendJson(res, 200, this.sensors.getPump());
                 break;
 
+            case "/log":
+                this.sendHtml(res, buildLogHtml());
+                break;
+
             case "/settings":
                 this.sendHtml(res, buildSettingsHtml());
                 break;
@@ -5745,6 +5785,7 @@ class FlowHttpServer {
 
             saveSensorConfig({ sensors: newSensors });
             this.sensors.temperature.renameSensors();
+            this.homekit?.updateSensorNames();
             logger.log(LogSeverity.Info, LogArea.Temperature, "sensor config updated");
             this.sendSensorSetupPage(res, true);
         });
@@ -6105,6 +6146,8 @@ class HomeKitBridge {
     private readonly sensors: SensorManager;
     private _setupURI: string | undefined;
     private _qrCodeSvg: string | undefined;
+    // Map sensor index → accessory, so names can be updated after sensor setup
+    private readonly tempAccessories = new Map<number, Accessory>();
 
     constructor(sensors: SensorManager) {
         this.sensors = sensors;
@@ -6118,9 +6161,29 @@ class HomeKitBridge {
         this.addDoorSensors();
     }
 
+    /** Update HomeKit accessory names to match current sensor names. */
+    public updateSensorNames(): void {
+        for (const sensor of this.sensors.temperature.getAllSensors()) {
+            const acc = this.tempAccessories.get(sensor.index);
+            if (!acc) { continue; }
+            const newName = `${sensor.name} Temperature`;
+            if (acc.displayName !== newName) {
+                acc.displayName = newName;
+                acc.getService(Service.AccessoryInformation)
+                    ?.updateCharacteristic(Characteristic.Name, newName);
+                acc.getService(Service.TemperatureSensor)
+                    ?.updateCharacteristic(Characteristic.Name, newName);
+                logger.log(LogSeverity.Info, LogArea.General,
+                    `HomeKit: renamed temperature sensor to "${newName}"`);
+            }
+        }
+    }
+
     private addTemperatureSensors(): void {
         for (const sensor of this.sensors.temperature.getAllSensors()) {
-            const accUuid = uuid.generate(`oyu:temp:${sensor.name}`);
+            // Use deviceId or index for stable UUID so renaming doesn't create a new accessory
+            const stableId = sensor.deviceId || String(sensor.index);
+            const accUuid = uuid.generate(`oyu:temp:${stableId}`);
             const acc = new Accessory(`${sensor.name} Temperature`, accUuid);
             acc.category = Categories.SENSOR;
 
@@ -6135,6 +6198,7 @@ class HomeKitBridge {
                 svc.updateCharacteristic(Characteristic.CurrentTemperature, newC);
             };
 
+            this.tempAccessories.set(sensor.index, acc);
             this.bridge.addBridgedAccessory(acc);
             logger.log(LogSeverity.Info, LogArea.General, `HomeKit: added temperature sensor "${sensor.name}"`);
         }
