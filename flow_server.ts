@@ -4,7 +4,8 @@ import { createServer, IncomingMessage, ServerResponse, Server } from "http";
 // url module no longer used — replaced by WHATWG URL API
 import {
     appendFileSync, readFileSync, writeFileSync, existsSync,
-    renameSync, readdirSync, unlinkSync, statSync, mkdirSync
+    renameSync, readdirSync, unlinkSync, statSync, mkdirSync,
+    openSync, writeSync, closeSync
 } from "fs";
 import { writeFile, rename, stat } from "fs/promises";
 import { join, dirname } from "path";
@@ -2101,14 +2102,19 @@ const SERIAL_BAUD = 9600;
  * to the Raspberry Pi UART (RXD/TXD GPIO pins).
  *
  * Protocol: 9600 baud, messages in the format:
- *   "DOORi:OPENss"  — door i opened for ss seconds (DOOR_STILL_OPEN_THRESHOLD = left open)
- *   "DOORi:CLOSE"   — door i closed
+ *   "DOORi:OPENss#dd"  — door i opened for ss seconds, sequence dd (DOOR_STILL_OPEN_THRESHOLD = left open)
+ *   "DOORi:CLOSE#dd"   — door i closed, sequence dd
+ * Acknowledgement: "ACKi:OPENss#dd" or "ACKi:CLOSE#dd" sent back on receipt.
+ * Duplicate sequence numbers (same door, same seq) are ignored.
  */
 class DoorMonitor {
     private serialProcess: ReturnType<typeof spawn> | undefined;
+    private serialWriteFd: number | undefined;
     private buffer = "";
     private readonly events: DoorEvent[] = [];
     private readonly maxEvents = 500;
+    /** Last received sequence number per door ID, for duplicate detection. */
+    private readonly lastSeq = new Map<number, number>();
     public onEvent?: (event: DoorEvent) => void;
 
     /** Start listening on the serial port. Only works on Linux. */
@@ -2126,6 +2132,14 @@ class DoorMonitor {
 
         // Configure HC12 channel via AT command mode (SET pin LOW = AT mode)
         this.configureHC12Channel();
+
+        // Open write fd for sending ACKs
+        try {
+            this.serialWriteFd = openSync(SERIAL_DEVICE, "w");
+        } catch (e) {
+            logger.logError(LogSeverity.Important, LogArea.General, e as Error,
+                `failed to open ${SERIAL_DEVICE} for writing (ACKs disabled)`);
+        }
 
         this.serialProcess = spawn("cat", [SERIAL_DEVICE], { stdio: ["ignore", "pipe", "ignore"] });
 
@@ -2202,6 +2216,10 @@ class DoorMonitor {
             this.serialProcess.kill();
             this.serialProcess = undefined;
         }
+        if (this.serialWriteFd !== undefined) {
+            try { closeSync(this.serialWriteFd); } catch { /* best effort */ }
+            this.serialWriteFd = undefined;
+        }
     }
 
     public get isRunning(): boolean {
@@ -2223,9 +2241,20 @@ class DoorMonitor {
             .map(([doorId, ev]) => ({ doorId, name: ev.name, lastEvent: ev }));
     }
 
+    /** Send an ACK back over the serial port. */
+    private sendAck(ack: string): void {
+        if (this.serialWriteFd === undefined) { return; }
+        try {
+            writeSync(this.serialWriteFd, ack);
+            logger.log(LogSeverity.Detail, LogArea.General, `door ACK sent: ${ack}`);
+        } catch (e) {
+            logger.logError(LogSeverity.Important, LogArea.General, e as Error, "failed to send door ACK");
+        }
+    }
+
     private parseBuffer(): void {
-        // Match DOOR messages: DOORi:OPENss or DOORi:CLOSE
-        const pattern = /DOOR(\d):(?:(OPEN)(\d{2})|(CLOSE))/g;
+        // Match DOOR messages: DOORi:OPENss#dd or DOORi:CLOSE#dd (with optional sequence number)
+        const pattern = /DOOR(\d):(?:(OPEN)(\d{2})|(CLOSE))(?:#(\d{2}))?/g;
         let match: RegExpExecArray | null;
         let lastIndex = 0;
 
@@ -2233,6 +2262,24 @@ class DoorMonitor {
             const doorId = parseInt(match[1], 10);
             const name = DOOR_NAMES[String(doorId)] || `Door ${doorId}`;
             const now = Date.now();
+            const seqStr = match[5];
+            const hasSeq = seqStr !== undefined;
+            const seq = hasSeq ? parseInt(seqStr, 10) : -1;
+
+            // Duplicate detection: if sequence matches the last one for this door, skip
+            if (hasSeq && this.lastSeq.get(doorId) === seq) {
+                logger.log(LogSeverity.Info, LogArea.General,
+                    `duplicate door message ignored: door ${doorId} seq ${seq}`);
+                lastIndex = pattern.lastIndex;
+                continue;
+            }
+
+            // Record sequence number and send ACK
+            if (hasSeq) {
+                this.lastSeq.set(doorId, seq);
+                const ack = match[0].replace("DOOR", "ACK");
+                this.sendAck(ack);
+            }
 
             if (match[2] === "OPEN") {
                 const seconds = parseInt(match[3], 10);
