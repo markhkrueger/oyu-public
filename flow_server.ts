@@ -290,7 +290,8 @@ const DEFAULT_LOCALE: LocaleStrings = {
     doors: "Doors", doorNoEvents: "No door events",
     doorOpenDuration: "open {duration}", doorStillOpen: "still open",
     log: "Log", logTitle: "System Log", logBackToDashboard: "Back to dashboard",
-    logEmpty: "No log entries.",
+    logEmpty: "No log entries.", logFilter: "Show:", logFilterAll: "All",
+    logFilterInfo: "Info and above", logFilterImportant: "Important and above",
     restart: "Restart",
     restartConfirm: "Restart the system? The dashboard will be unavailable for a few seconds.",
     restartMessage: "Restarting...",
@@ -3014,19 +3015,49 @@ function buildLogHtml(): string {
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
          background: #0f172a; color: #e2e8f0; padding: 24px; }
   h1 { font-size: 1.4rem; font-weight: 600; margin-bottom: 20px; color: #94a3b8; }
+  .filter-bar { margin-bottom: 12px; }
+  .filter-bar label { color: #94a3b8; font-size: 0.85rem; margin-right: 8px; }
+  .filter-bar select { padding: 6px 10px; border-radius: 6px; border: 1px solid #475569;
+         background: #1e293b; color: #e2e8f0; font-size: 0.85rem; }
   .log-container { background: #1e293b; border-radius: 10px; padding: 16px; overflow-x: auto; }
   pre { font-family: "SF Mono", "Menlo", "Monaco", "Courier New", monospace;
         font-size: 0.8rem; line-height: 1.5; color: #cbd5e1; white-space: pre-wrap; word-break: break-all; }
+  .log-line { }
+  .log-line.hidden { display: none; }
   a { color: #94a3b8; }
   .footer { margin-top: 16px; }
 </style>
 </head>
 <body>
 <h1>${L("logTitle")}</h1>
+<div class="filter-bar">
+  <label for="severity">${L("logFilter")}</label>
+  <select id="severity" onchange="applyFilter()">
+    <option value="all">${L("logFilterAll")}</option>
+    <option value="info">${L("logFilterInfo")}</option>
+    <option value="important">${L("logFilterImportant")}</option>
+  </select>
+</div>
 <div class="log-container">
-<pre>${escaped || L("logEmpty")}</pre>
+<pre id="log-pre">${escaped || L("logEmpty")}</pre>
 </div>
 <p class="footer"><a href="/">${L("logBackToDashboard")}</a></p>
+<script>
+var logPre = document.getElementById("log-pre");
+var rawHtml = logPre.innerHTML;
+function applyFilter() {
+  var level = document.getElementById("severity").value;
+  var lines = rawHtml.split("\\n");
+  var filtered = lines.map(function(line) {
+    if (level === "all") return line;
+    var isImportant = /\\[Important\\]|\\[Severe\\]|\\[Priority\\]/.test(line);
+    if (level === "important") return isImportant ? line : null;
+    var isInfo = /\\[Info\\]/.test(line);
+    return (isImportant || isInfo) ? line : null;
+  }).filter(function(l) { return l !== null; });
+  logPre.innerHTML = filtered.join("\\n");
+}
+</script>
 </body>
 </html>`;
 }
