@@ -156,6 +156,7 @@ These are the npm packages required at runtime by flow_server.js:
 | @homebridge/hap-nodejs| HomeKit accessory protocol for smart home  |
 | qrcode                | QR code generation for HomeKit pairing     |
 | systeminformation     | System info (CPU temp, network, disk, etc) |
+| glob                  | file globbing for finding sensor files     |
 
 Note: Node.js built-in modules (`http`, `fs`, `path`, `crypto`, `child_process`, `url`, `os`) require no installation. GPIO interaction uses `gpiomon`/`gpioset` from libgpiod (installed above), not an npm package.
 
@@ -215,9 +216,11 @@ The QR code on the dashboard will update automatically with the new pin.
 
 The flow server runs as a systemd service so it starts automatically at boot and restarts on failure.
 
+Edit the flow-server.service and update the text that says <your-user> to your actual username.
+
 Install the service:
 
-    sudo cp /home/mark/flow/flow-server.service /etc/systemd/system/
+    sudo cp ~/flow/flow-server.service /etc/systemd/system/
     sudo systemctl daemon-reload
     sudo systemctl enable flow-server
     sudo systemctl start flow-server
