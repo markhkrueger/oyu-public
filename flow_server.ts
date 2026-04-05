@@ -290,7 +290,7 @@ const DEFAULT_LOCALE: LocaleStrings = {
     doors: "Doors", doorNoEvents: "No door events",
     doorOpenDuration: "open {duration}", doorStillOpen: "still open",
     log: "Log", logTitle: "System Log", logBackToDashboard: "Back to dashboard",
-    logEmpty: "No log entries.", logFilter: "Show:", logFilterAll: "All",
+    logEmpty: "No log entries.", logFilter: "Level:", logArea: "Area:", logFilterAll: "All",
     logFilterInfo: "Info and above", logFilterImportant: "Important and above",
     restart: "Restart",
     restartConfirm: "Restart the system? The dashboard will be unavailable for a few seconds.",
@@ -1253,6 +1253,7 @@ enum LogArea {
     GPIO = "GPIO",
     Flow = "FLOW",
     General = "GENERAL",
+    Serial = "SERIAL",
     Server = "SERVER",
     Temperature = "TEMP",
 }
@@ -2126,7 +2127,7 @@ class DoorMonitor {
         try {
             execSync(`stty -F ${SERIAL_DEVICE} ${SERIAL_BAUD} raw -echo`, { timeout: 5000, stdio: "pipe" });
         } catch (e) {
-            logger.logError(LogSeverity.Severe, LogArea.General, e as Error,
+            logger.logError(LogSeverity.Severe, LogArea.Serial, e as Error,
                 `failed to configure serial port ${SERIAL_DEVICE}`);
             return;
         }
@@ -2138,7 +2139,7 @@ class DoorMonitor {
         try {
             this.serialWriteFd = openSync(SERIAL_DEVICE, "w");
         } catch (e) {
-            logger.logError(LogSeverity.Important, LogArea.General, e as Error,
+            logger.logError(LogSeverity.Important, LogArea.Serial, e as Error,
                 `failed to open ${SERIAL_DEVICE} for writing (ACKs disabled)`);
         }
 
@@ -2150,17 +2151,17 @@ class DoorMonitor {
         });
 
         this.serialProcess.on("error", (err) => {
-            logger.logError(LogSeverity.Severe, LogArea.General, err,
+            logger.logError(LogSeverity.Severe, LogArea.Serial, err,
                 `serial port error on ${SERIAL_DEVICE}`);
         });
 
         this.serialProcess.on("exit", (code) => {
-            logger.log(LogSeverity.Info, LogArea.General,
+            logger.log(LogSeverity.Info, LogArea.Serial,
                 `serial reader exited with code ${code}`);
             this.serialProcess = undefined;
         });
 
-        logger.log(LogSeverity.Info, LogArea.General,
+        logger.log(LogSeverity.Info, LogArea.Serial,
             `door monitor started on ${SERIAL_DEVICE} channel ${HC12_SERIAL_CHANNEL} @ ${SERIAL_BAUD} baud`);
     }
 
@@ -2191,14 +2192,14 @@ class DoorMonitor {
             }
 
             if (result.includes("OK")) {
-                logger.log(LogSeverity.Info, LogArea.General,
+                logger.log(LogSeverity.Info, LogArea.Serial,
                     `HC12 set to channel ${HC12_SERIAL_CHANNEL} (${result})`);
             } else {
-                logger.log(LogSeverity.Important, LogArea.General,
+                logger.log(LogSeverity.Important, LogArea.Serial,
                     `HC12 channel ${HC12_SERIAL_CHANNEL} response: ${result || "(no response)"}`);
             }
         } catch (e) {
-            logger.logError(LogSeverity.Important, LogArea.General, e as Error,
+            logger.logError(LogSeverity.Important, LogArea.Serial, e as Error,
                 `failed to configure HC12 channel ${HC12_SERIAL_CHANNEL}`);
         } finally {
             // Kill the LOW holder and drive SET pin HIGH to exit AT mode
@@ -2247,9 +2248,9 @@ class DoorMonitor {
         if (this.serialWriteFd === undefined) { return; }
         try {
             writeSync(this.serialWriteFd, ack);
-            logger.log(LogSeverity.Detail, LogArea.General, `door ACK sent: ${ack}`);
+            logger.log(LogSeverity.Detail, LogArea.Serial, `door ACK sent: ${ack}`);
         } catch (e) {
-            logger.logError(LogSeverity.Important, LogArea.General, e as Error, "failed to send door ACK");
+            logger.logError(LogSeverity.Important, LogArea.Serial, e as Error, "failed to send door ACK");
         }
     }
 
@@ -2267,9 +2268,11 @@ class DoorMonitor {
             const hasSeq = seqStr !== undefined;
             const seq = hasSeq ? parseInt(seqStr, 10) : -1;
 
+            logger.log(LogSeverity.Detail, LogArea.Serial, match.toString());
+
             // Duplicate detection: if sequence matches the last one for this door, skip
             if (hasSeq && this.lastSeq.get(doorId) === seq) {
-                logger.log(LogSeverity.Info, LogArea.General,
+                logger.log(LogSeverity.Info, LogArea.Serial,
                     `duplicate door message ignored: door ${doorId} seq ${seq}`);
                 lastIndex = pattern.lastIndex;
                 continue;
@@ -2310,7 +2313,7 @@ class DoorMonitor {
         if (this.events.length > this.maxEvents) {
             this.events.splice(0, this.events.length - this.maxEvents);
         }
-        logger.log(LogSeverity.Info, LogArea.General,
+        logger.log(LogSeverity.Info, LogArea.Serial,
             event.type === "open"
                 ? `${event.name} opened (${event.openSeconds}s${event.openSeconds === DOOR_STILL_OPEN_THRESHOLD ? " — left open" : ""})`
                 : `${event.name} closed`);
@@ -3015,8 +3018,8 @@ function buildLogHtml(): string {
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
          background: #0f172a; color: #e2e8f0; padding: 24px; }
   h1 { font-size: 1.4rem; font-weight: 600; margin-bottom: 20px; color: #94a3b8; }
-  .filter-bar { margin-bottom: 12px; }
-  .filter-bar label { color: #94a3b8; font-size: 0.85rem; margin-right: 8px; }
+  .filter-bar { margin-bottom: 12px; display: flex; gap: 16px; flex-wrap: wrap; align-items: center; }
+  .filter-bar label { color: #94a3b8; font-size: 0.85rem; margin-right: 4px; }
   .filter-bar select { padding: 6px 10px; border-radius: 6px; border: 1px solid #475569;
          background: #1e293b; color: #e2e8f0; font-size: 0.85rem; }
   .log-container { background: #1e293b; border-radius: 10px; padding: 16px; overflow-x: auto; }
@@ -3031,12 +3034,26 @@ function buildLogHtml(): string {
 <body>
 <h1>${L("logTitle")}</h1>
 <div class="filter-bar">
-  <label for="severity">${L("logFilter")}</label>
-  <select id="severity" onchange="applyFilter()">
-    <option value="all">${L("logFilterAll")}</option>
-    <option value="info">${L("logFilterInfo")}</option>
-    <option value="important">${L("logFilterImportant")}</option>
-  </select>
+  <span>
+    <label for="severity">${L("logFilter")}</label>
+    <select id="severity" onchange="applyFilter()">
+      <option value="all">${L("logFilterAll")}</option>
+      <option value="info">${L("logFilterInfo")}</option>
+      <option value="important">${L("logFilterImportant")}</option>
+    </select>
+  </span>
+  <span>
+    <label for="area">${L("logArea")}</label>
+    <select id="area" onchange="applyFilter()">
+      <option value="all">${L("logFilterAll")}</option>
+      <option value="GENERAL">General</option>
+      <option value="SERVER">Server</option>
+      <option value="SERIAL">Serial</option>
+      <option value="TEMP">Temperature</option>
+      <option value="FLOW">Flow</option>
+      <option value="GPIO">GPIO</option>
+    </select>
+  </span>
 </div>
 <div class="log-container">
 <pre id="log-pre">${escaped || L("logEmpty")}</pre>
@@ -3047,15 +3064,23 @@ var logPre = document.getElementById("log-pre");
 var rawHtml = logPre.innerHTML;
 function applyFilter() {
   var level = document.getElementById("severity").value;
+  var area = document.getElementById("area").value;
   var lines = rawHtml.split("\\n");
-  var filtered = lines.map(function(line) {
-    if (level === "all") return line;
-    var isImportant = /\\[Important\\]|\\[Severe\\]|\\[Priority\\]/.test(line);
-    if (level === "important") return isImportant ? line : null;
-    var isInfo = /\\[Info\\]/.test(line);
-    return (isImportant || isInfo) ? line : null;
-  }).filter(function(l) { return l !== null; });
-  logPre.innerHTML = filtered.join("\\n");
+  var filtered = lines.filter(function(line) {
+    if (!line.trim()) return false;
+    // Severity filter
+    if (level !== "all") {
+      var isImportant = /\\[Important\\]|\\[Severe\\]|\\[Priority\\]/.test(line);
+      if (level === "important" && !isImportant) return false;
+      if (level === "info" && !isImportant && !/\\[Info\\]/.test(line)) return false;
+    }
+    // Area filter
+    if (area !== "all") {
+      if (line.indexOf("(" + area + ")") === -1) return false;
+    }
+    return true;
+  });
+  logPre.innerHTML = filtered.join("\\n") || "${L("logEmpty")}";
 }
 </script>
 </body>
