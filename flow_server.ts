@@ -4,8 +4,7 @@ import { createServer, IncomingMessage, ServerResponse, Server } from "http";
 // url module no longer used — replaced by WHATWG URL API
 import {
     appendFileSync, readFileSync, writeFileSync, existsSync,
-    renameSync, readdirSync, unlinkSync, statSync, mkdirSync,
-    openSync, writeSync, closeSync
+    renameSync, readdirSync, unlinkSync, statSync, mkdirSync
 } from "fs";
 import { writeFile, rename, stat } from "fs/promises";
 import { join, dirname } from "path";
@@ -2111,7 +2110,6 @@ const SERIAL_BAUD = 9600;
  */
 class DoorMonitor {
     private serialProcess: ReturnType<typeof spawn> | undefined;
-    private serialWriteFd: number | undefined;
     private buffer = "";
     private readonly events: DoorEvent[] = [];
     private readonly maxEvents = 500;
@@ -2123,31 +2121,37 @@ class DoorMonitor {
     public start(): void {
         if (!IS_LINUX || !DOOR_MONITOR_ENABLED) { return; }
 
-        // Configure baud rate via stty, then tail the device for incoming data
-        try {
-            execSync(`stty -F ${SERIAL_DEVICE} ${SERIAL_BAUD} raw -echo`, { timeout: 5000, stdio: "pipe" });
-        } catch (e) {
-            logger.logError(LogSeverity.Severe, LogArea.Serial, e as Error,
-                `failed to configure serial port ${SERIAL_DEVICE}`);
-            return;
-        }
-
-        // Configure HC12 channel via AT command mode (SET pin LOW = AT mode)
+        // Configure HC12 channel via AT command mode (runs stty internally)
         this.configureHC12Channel();
 
-        // Open write fd for sending ACKs
-        try {
-            this.serialWriteFd = openSync(SERIAL_DEVICE, "w");
-        } catch (e) {
-            logger.logError(LogSeverity.Important, LogArea.Serial, e as Error,
-                `failed to open ${SERIAL_DEVICE} for writing (ACKs disabled)`);
-        }
+        // Start the serial reader — cat with auto-restart if it exits
+        this.startSerialReader();
 
-        this.serialProcess = spawn("cat", [SERIAL_DEVICE], { stdio: ["ignore", "pipe", "ignore"] });
+        logger.log(LogSeverity.Info, LogArea.Serial,
+            `door monitor started on ${SERIAL_DEVICE} channel ${HC12_SERIAL_CHANNEL} @ ${SERIAL_BAUD} baud`);
+    }
+
+    private stopped = false;
+
+    /** Start cat on the serial device, with auto-restart on exit. */
+    private startSerialReader(): void {
+        // Re-apply stty raw before each cat start
+        try {
+            execSync(`stty -F ${SERIAL_DEVICE} ${SERIAL_BAUD} raw -echo`, { timeout: 5000, stdio: "pipe" });
+        } catch { /* ExecStartPre handles this if we can't */ }
+
+        this.serialProcess = spawn("cat", [SERIAL_DEVICE], { stdio: ["ignore", "pipe", "pipe"] });
 
         this.serialProcess.stdout?.on("data", (chunk: Buffer) => {
-            this.buffer += chunk.toString("utf-8");
+            const data = chunk.toString("utf-8");
+            //logger.log(LogSeverity.Detail, LogArea.Serial,`serial rx (${chunk.length} bytes): ${JSON.stringify(data)}`);
+            this.buffer += data;
             this.parseBuffer();
+        });
+
+        this.serialProcess.stderr?.on("data", (chunk: Buffer) => {
+            logger.log(LogSeverity.Important, LogArea.Serial,
+                `cat stderr: ${chunk.toString().trim()}`);
         });
 
         this.serialProcess.on("error", (err) => {
@@ -2156,18 +2160,20 @@ class DoorMonitor {
         });
 
         this.serialProcess.on("exit", (code) => {
-            logger.log(LogSeverity.Info, LogArea.Serial,
-                `serial reader exited with code ${code}`);
             this.serialProcess = undefined;
+            if (this.stopped) { return; }
+            logger.log(LogSeverity.Info, LogArea.Serial,
+                `serial reader exited with code ${code}, restarting in 1s`);
+            setTimeout(() => {
+                if (!this.stopped) { this.startSerialReader(); }
+            }, 1000);
         });
-
-        logger.log(LogSeverity.Info, LogArea.Serial,
-            `door monitor started on ${SERIAL_DEVICE} channel ${HC12_SERIAL_CHANNEL} @ ${SERIAL_BAUD} baud`);
     }
 
     /** Set the HC12 wireless module to the configured channel via AT commands.
+     *  All serial I/O uses shell commands (via ExecStartPre stty config).
      *  Pulls the SET pin LOW to enter AT mode, sends the channel command, then
-     *  releases the pin back to HIGH for normal transparent mode. */
+     *  re-applies stty raw mode and releases the pin back to HIGH. */
     private configureHC12Channel(): void {
         const channel = String(HC12_SERIAL_CHANNEL).padStart(3, "0");
         let setProc: ReturnType<typeof spawn> | undefined;
@@ -2177,27 +2183,16 @@ class DoorMonitor {
             // HC12 needs ~40ms to enter AT mode
             execSync("sleep 0.1", { timeout: 2000 });
 
-            // Send AT channel command; read response with timeout (head blocks until byte count)
-            execSync(`echo -ne "AT+C${channel}\\r\\n" > ${SERIAL_DEVICE}`, { timeout: 2000, stdio: "pipe" });
-            let result = "";
+            // Send AT channel command and discard response — all via shell to avoid
+            // Node file I/O which resets terminal settings on tty devices
             try {
-                result = execSync(
-                    `timeout 1 head -c 100 ${SERIAL_DEVICE}`,
-                    { timeout: 3000, stdio: "pipe" },
-                ).toString().trim();
-            } catch (readErr) {
-                // timeout exits 124 when it kills head — capture any partial output
-                const output = (readErr as { stdout?: Buffer }).stdout;
-                if (output) { result = output.toString().trim(); }
-            }
-
-            if (result.includes("OK")) {
-                logger.log(LogSeverity.Info, LogArea.Serial,
-                    `HC12 set to channel ${HC12_SERIAL_CHANNEL} (${result})`);
-            } else {
-                logger.log(LogSeverity.Important, LogArea.Serial,
-                    `HC12 channel ${HC12_SERIAL_CHANNEL} response: ${result || "(no response)"}`);
-            }
+                execSync(
+                    `echo -ne "AT+C${channel}\\r\\n" > ${SERIAL_DEVICE}`,
+                    { timeout: 2000, stdio: "pipe" });
+                execSync("sleep 0.2", { timeout: 2000 });
+            } catch { /* best effort */ }
+            logger.log(LogSeverity.Info, LogArea.Serial,
+                `HC12 channel set to ${HC12_SERIAL_CHANNEL}`);
         } catch (e) {
             logger.logError(LogSeverity.Important, LogArea.Serial, e as Error,
                 `failed to configure HC12 channel ${HC12_SERIAL_CHANNEL}`);
@@ -2206,21 +2201,25 @@ class DoorMonitor {
             if (setProc) { setProc.kill(); }
             try {
                 const highProc = spawn("gpioset", ["--chip", "0", `${HC12_SET_PIN}=1`]);
-                // Wait briefly for the pin to latch, then release
                 execSync("sleep 0.05", { timeout: 2000 });
                 highProc.kill();
             } catch { /* best effort */ }
+            // Re-apply raw mode — the echo/shell commands above reset terminal settings
+            try {
+                execSync(`stty -F ${SERIAL_DEVICE} ${SERIAL_BAUD} raw -echo`,
+                    { timeout: 5000, stdio: "pipe" });
+            } catch (e) {
+                logger.logError(LogSeverity.Important, LogArea.Serial, e as Error,
+                    `stty re-apply failed after HC12 config`);
+            }
         }
     }
 
     public stop(): void {
+        this.stopped = true;
         if (this.serialProcess) {
             this.serialProcess.kill();
             this.serialProcess = undefined;
-        }
-        if (this.serialWriteFd !== undefined) {
-            try { closeSync(this.serialWriteFd); } catch { /* best effort */ }
-            this.serialWriteFd = undefined;
         }
     }
 
@@ -2243,11 +2242,12 @@ class DoorMonitor {
             .map(([doorId, ev]) => ({ doorId, name: ev.name, lastEvent: ev }));
     }
 
-    /** Send an ACK back over the serial port. */
+    /** Send an ACK back over the serial port via shell to preserve tty settings. */
     private sendAck(ack: string): void {
-        if (this.serialWriteFd === undefined) { return; }
         try {
-            writeSync(this.serialWriteFd, ack);
+            execSync(`echo -ne "${ack}" > ${SERIAL_DEVICE}`, { timeout: 2000, stdio: "pipe" });
+            // Re-apply raw mode after shell write
+            execSync(`stty -F ${SERIAL_DEVICE} ${SERIAL_BAUD} raw -echo`, { timeout: 2000, stdio: "pipe" });
             logger.log(LogSeverity.Detail, LogArea.Serial, `door ACK sent: ${ack}`);
         } catch (e) {
             logger.logError(LogSeverity.Important, LogArea.Serial, e as Error, "failed to send door ACK");
@@ -3061,27 +3061,49 @@ function buildLogHtml(): string {
 <p class="footer"><a href="/">${L("logBackToDashboard")}</a></p>
 <script>
 var logPre = document.getElementById("log-pre");
-var rawHtml = logPre.innerHTML;
-function applyFilter() {
+var rawText = "";
+var lastRawLen = 0;
+
+function escapeHtml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function filterLines(text) {
   var level = document.getElementById("severity").value;
   var area = document.getElementById("area").value;
-  var lines = rawHtml.split("\\n");
-  var filtered = lines.filter(function(line) {
+  var lines = text.split("\\n");
+  return lines.filter(function(line) {
     if (!line.trim()) return false;
-    // Severity filter
     if (level !== "all") {
       var isImportant = /\\[Important\\]|\\[Severe\\]|\\[Priority\\]/.test(line);
       if (level === "important" && !isImportant) return false;
       if (level === "info" && !isImportant && !/\\[Info\\]/.test(line)) return false;
     }
-    // Area filter
     if (area !== "all") {
       if (line.indexOf("(" + area + ")") === -1) return false;
     }
     return true;
-  });
-  logPre.innerHTML = filtered.join("\\n") || "${L("logEmpty")}";
+  }).join("\\n");
 }
+
+function applyFilter() {
+  logPre.innerHTML = escapeHtml(filterLines(rawText)) || "${L("logEmpty")}";
+}
+
+function refreshLog() {
+  fetch("/api/log").then(function(r) { return r.text(); }).then(function(text) {
+    if (text.length !== lastRawLen) {
+      lastRawLen = text.length;
+      rawText = text;
+      applyFilter();
+    }
+  }).catch(function() {});
+}
+
+// Initialize from server-rendered content
+rawText = logPre.textContent || "";
+lastRawLen = rawText.length;
+setInterval(refreshLog, 5000);
 </script>
 </body>
 </html>`;
@@ -5636,6 +5658,12 @@ class FlowHttpServer {
                 this.sendDashboardCards(res);
                 break;
 
+            case "/api/log": {
+                const logText = logger.fullLog(LogSeverity.Detail);
+                this.sendText(res, logText);
+                break;
+            }
+
             case "/status":
                 this.sendJson(res, 200, this.sensors.getStatus());
                 break;
@@ -6135,6 +6163,14 @@ class FlowHttpServer {
             "Content-Length": Buffer.byteLength(html),
         });
         res.end(html);
+    }
+
+    private sendText(res: ServerResponse, text: string): void {
+        res.writeHead(200, {
+            "Content-Type": "text/plain; charset=utf-8",
+            "Content-Length": Buffer.byteLength(text),
+        });
+        res.end(text);
     }
 
     private sendJson(res: ServerResponse, status: number, body: object): void {

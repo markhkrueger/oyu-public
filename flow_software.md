@@ -21,6 +21,41 @@ DS18B20 temperature sensors use the 1-wire bus on GPIO 4. To enable it, edit `/b
 
 The `enable_uart=1` line enables the serial port on GPIO 14 (TXD) and GPIO 15 (RXD) at `/dev/serial0`, used by the HC12 wireless module for the door sensor.
 
+### Serial Port Setup
+
+The serial port is only required if your hardware includes the HC12 transceiver for monitoring door sensors. If you are not using the door sensors, you can skip this section.
+
+The serial port requires several configuration steps:
+
+**1. Disable the serial console login shell** — by default, `agetty` runs on the serial port and will consume all incoming data:
+
+    sudo systemctl stop serial-getty@ttyS0.service
+    sudo systemctl disable serial-getty@ttyS0.service
+
+Also edit `/boot/firmware/cmdline.txt` and remove any `console=serial0` or `console=ttyS0` entries if present. Keep `console=tty1`.
+
+**2. Add your user to the serial port groups:**
+
+    sudo usermod -aG dialout,tty $USER
+
+**3. Fix device permissions** — the default permissions on some OS versions don't grant group read/write. Add a udev rule:
+
+    echo 'SUBSYSTEM=="tty", KERNEL=="ttyS0", RUN+="/bin/chmod 0660 /dev/ttyS0", RUN+="/bin/chgrp tty /dev/ttyS0"' | sudo tee /etc/udev/rules.d/99-serial.rules
+    sudo udevadm control --reload-rules
+    sudo udevadm trigger /dev/ttyS0
+
+**4. Reboot** to apply all changes:
+
+    sudo reboot
+
+**5. Verify** the serial port is accessible and receiving data:
+
+    ls -la /dev/ttyS0          # should show crw-rw---- ... root tty
+    stty -F /dev/serial0 9600 raw -echo
+    cat /dev/serial0            # should show incoming data without permission errors
+
+Note: the `flow-server.service` file includes an `ExecStartPre` command that sets permissions and configures the serial port baud rate as root before starting the server, as a safeguard against permissions being reset.
+
 Also disable camera and display auto-detection, which can conflict with the 1-wire overlay. This system runs headless and doesn't use a camera or display, so comment these out:
 
     #camera_auto_detect=1

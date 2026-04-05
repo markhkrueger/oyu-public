@@ -11,11 +11,13 @@
 #   journalctl -u flow-server -f         # tail logs
 #   sudo systemctl restart flow-server   # manual restart
 
-[Unit]
-Description=OYU Flow Server
-After=network.target
-
+[Unit]                                                                                                                                                                                                     
+  Description=OYU Flow Server
+  After=network.target dev-ttyS0.device                                                                                                                                                                       
+  Wants=dev-ttyS0.device
+ 
 [Service]
+ExecStartPre=+/bin/sh -c '/bin/chgrp tty /dev/ttyS0 && /bin/chmod 0660 /dev/ttyS0 && /bin/stty -F /dev/ttyS0 9600 raw -echo'
 ExecStart=/usr/bin/node /home/<your-user>/flow/flow_server.js -s
 WorkingDirectory=/home/<your-user>/flow
 Restart=on-failure
