@@ -3,6 +3,9 @@ import {
     pwToFlow,
     parseArgs,
     FlowHttpServer,
+    DoorMonitor,
+    DoorEvent,
+    DOOR_STILL_OPEN_SENTINEL,
     SensorManager,
     LogSeverity,
     LogArea,
@@ -1146,5 +1149,241 @@ describe("applyConfig", () => {
         applyConfig({});
         expect(DEFAULT_PORT).toBe(origPort);
         expect(FLOW_START_DELAY).toBe(origFlowStart);
+    });
+});
+
+// ---- OYU Protocol Tests ----
+
+/** Build a valid OYU message with correct checksum. */
+function oyuMsg(body: string): string {
+    let xor = 0;
+    for (let i = 0; i < body.length; i++) {
+        xor ^= body.charCodeAt(i);
+    }
+    const xsum = xor.toString(16).padStart(2, "0").toUpperCase();
+    return `${body}|${xsum}\n`;
+}
+
+describe("DoorMonitor.xorChecksum", () => {
+    it("should compute correct XOR for simple string", () => {
+        // "AB" = 0x41 ^ 0x42 = 0x03
+        expect(DoorMonitor.xorChecksum("AB")).toBe("03");
+    });
+
+    it("should return 2-digit uppercase hex", () => {
+        const result = DoorMonitor.xorChecksum("OYU:01:OPEN:05:00");
+        expect(result).toMatch(/^[0-9A-F]{2}$/);
+    });
+
+    it("should return 00 for empty string", () => {
+        expect(DoorMonitor.xorChecksum("")).toBe("00");
+    });
+});
+
+describe("DoorMonitor protocol parsing", () => {
+    let monitor: DoorMonitor;
+    let receivedEvents: DoorEvent[];
+
+    beforeEach(() => {
+        monitor = new DoorMonitor();
+        receivedEvents = [];
+        monitor.onEvent = (ev) => receivedEvents.push(ev);
+    });
+
+    // ---- OPEN messages ----
+
+    it("should parse a valid OPEN message", () => {
+        monitor.feedData(oyuMsg("OYU:01:OPEN:05:00"));
+        expect(receivedEvents).toHaveLength(1);
+        expect(receivedEvents[0].doorId).toBe(1);
+        expect(receivedEvents[0].type).toBe("open");
+        expect(receivedEvents[0].openSeconds).toBe(5);
+    });
+
+    it("should parse OPEN with zero seconds", () => {
+        monitor.feedData(oyuMsg("OYU:01:OPEN:00:00"));
+        expect(receivedEvents).toHaveLength(1);
+        expect(receivedEvents[0].openSeconds).toBe(0);
+    });
+
+    it("should parse OPEN with sentinel 99 as still open", () => {
+        monitor.feedData(oyuMsg("OYU:01:OPEN:99:00"));
+        expect(receivedEvents).toHaveLength(1);
+        expect(receivedEvents[0].openSeconds).toBe(DOOR_STILL_OPEN_SENTINEL);
+    });
+
+    it("should reject OPEN with seconds between 60 and 98", () => {
+        monitor.feedData(oyuMsg("OYU:01:OPEN:75:00"));
+        expect(receivedEvents).toHaveLength(0);
+    });
+
+    // ---- CLOSE messages ----
+
+    it("should parse a valid CLOSE message with empty data field", () => {
+        monitor.feedData(oyuMsg("OYU:02:CLOSE::00"));
+        expect(receivedEvents).toHaveLength(1);
+        expect(receivedEvents[0].doorId).toBe(2);
+        expect(receivedEvents[0].type).toBe("close");
+    });
+
+    // ---- Sequence numbers and duplicates ----
+
+    it("should ignore duplicate sequence numbers for the same sensor", () => {
+        monitor.feedData(oyuMsg("OYU:01:OPEN:05:03"));
+        monitor.feedData(oyuMsg("OYU:01:OPEN:10:03"));  // same seq
+        expect(receivedEvents).toHaveLength(1);
+        expect(receivedEvents[0].openSeconds).toBe(5);
+    });
+
+    it("should accept same sequence number from different sensors", () => {
+        monitor.feedData(oyuMsg("OYU:01:OPEN:05:03"));
+        monitor.feedData(oyuMsg("OYU:02:OPEN:10:03"));  // different sensor
+        expect(receivedEvents).toHaveLength(2);
+    });
+
+    it("should accept new sequence number from same sensor", () => {
+        monitor.feedData(oyuMsg("OYU:01:OPEN:05:03"));
+        monitor.feedData(oyuMsg("OYU:01:CLOSE::04"));   // seq incremented
+        expect(receivedEvents).toHaveLength(2);
+    });
+
+    it("should handle sequence number wraparound", () => {
+        monitor.feedData(oyuMsg("OYU:01:OPEN:05:99"));
+        monitor.feedData(oyuMsg("OYU:01:CLOSE::00"));   // wrapped
+        expect(receivedEvents).toHaveLength(2);
+    });
+
+    // ---- Checksum validation ----
+
+    it("should reject message with bad checksum", () => {
+        monitor.feedData("OYU:01:OPEN:05:00|FF\n");  // wrong checksum
+        expect(receivedEvents).toHaveLength(0);
+    });
+
+    it("should reject message without checksum separator", () => {
+        monitor.feedData("OYU:01:OPEN:05:00\n");
+        expect(receivedEvents).toHaveLength(0);
+    });
+
+    // ---- Message validation ----
+
+    it("should reject message over 32 bytes", () => {
+        const longBody = "OYU:01:OPEN:" + "0".repeat(20) + ":00";
+        monitor.feedData(oyuMsg(longBody));
+        expect(receivedEvents).toHaveLength(0);
+    });
+
+    it("should reject unknown verb", () => {
+        monitor.feedData(oyuMsg("OYU:01:PING:data:00"));
+        expect(receivedEvents).toHaveLength(0);
+    });
+
+    it("should reject invalid sensor ID", () => {
+        monitor.feedData(oyuMsg("OYU:XX:OPEN:05:00"));
+        expect(receivedEvents).toHaveLength(0);
+    });
+
+    it("should reject invalid sequence number", () => {
+        monitor.feedData(oyuMsg("OYU:01:OPEN:05:AB"));
+        expect(receivedEvents).toHaveLength(0);
+    });
+
+    it("should ignore non-OYU data in buffer", () => {
+        monitor.feedData("garbage data\nmore junk\n");
+        monitor.feedData(oyuMsg("OYU:01:OPEN:05:00"));
+        expect(receivedEvents).toHaveLength(1);
+    });
+
+    // ---- BAT / CPU / SER / VER messages ----
+
+    it("should parse BAT message and update sensor status", () => {
+        monitor.feedData(oyuMsg("OYU:01:BAT:4200:00"));
+        expect(receivedEvents).toHaveLength(0);  // BAT is not a door event
+        const status = monitor.getAllSensorStatus().get(1);
+        expect(status).toBeDefined();
+        expect(status!.batteryMv).toBe(4200);
+    });
+
+    it("should parse CPU message and update sensor status", () => {
+        monitor.feedData(oyuMsg("OYU:01:CPU:003600:00"));
+        const status = monitor.getAllSensorStatus().get(1);
+        expect(status).toBeDefined();
+        expect(status!.cpuUptime).toBe(3600);
+    });
+
+    it("should parse SER message and update sensor status", () => {
+        monitor.feedData(oyuMsg("OYU:01:SER:001200:00"));
+        const status = monitor.getAllSensorStatus().get(1);
+        expect(status).toBeDefined();
+        expect(status!.serialUptime).toBe(1200);
+    });
+
+    it("should parse VER message and update sensor status", () => {
+        monitor.feedData(oyuMsg("OYU:01:VER:0001:00"));
+        const status = monitor.getAllSensorStatus().get(1);
+        expect(status).toBeDefined();
+        expect(status!.version).toBe(1);
+    });
+
+    it("should identify test mode version", () => {
+        monitor.feedData(oyuMsg("OYU:01:VER:1001:00"));
+        const status = monitor.getAllSensorStatus().get(1);
+        expect(status!.version).toBe(1001);
+        // version >= 1000 = test mode per protocol
+    });
+
+    // ---- Multiple messages in one buffer ----
+
+    it("should parse multiple messages delivered in one chunk", () => {
+        const msg1 = oyuMsg("OYU:01:OPEN:05:00");
+        const msg2 = oyuMsg("OYU:01:CLOSE::01");
+        monitor.feedData(msg1 + msg2);
+        expect(receivedEvents).toHaveLength(2);
+        expect(receivedEvents[0].type).toBe("open");
+        expect(receivedEvents[1].type).toBe("close");
+    });
+
+    it("should handle partial message across multiple feedData calls", () => {
+        const msg = oyuMsg("OYU:01:OPEN:30:00");
+        const half = Math.floor(msg.length / 2);
+        monitor.feedData(msg.slice(0, half));
+        expect(receivedEvents).toHaveLength(0);  // not complete yet
+        monitor.feedData(msg.slice(half));
+        expect(receivedEvents).toHaveLength(1);
+    });
+
+    // ---- getDoorStates / getRecentEvents ----
+
+    it("should track door states across events", () => {
+        monitor.feedData(oyuMsg("OYU:01:OPEN:05:00"));
+        monitor.feedData(oyuMsg("OYU:02:CLOSE::00"));
+        const states = monitor.getDoorStates();
+        expect(states).toHaveLength(2);
+        expect(states[0].doorId).toBe(1);
+        expect(states[0].lastEvent.type).toBe("open");
+        expect(states[1].doorId).toBe(2);
+        expect(states[1].lastEvent.type).toBe("close");
+    });
+
+    it("should return recent events in order", () => {
+        monitor.feedData(oyuMsg("OYU:01:OPEN:05:00"));
+        monitor.feedData(oyuMsg("OYU:01:CLOSE::01"));
+        const events = monitor.getRecentEvents();
+        expect(events).toHaveLength(2);
+        expect(events[0].type).toBe("open");
+        expect(events[1].type).toBe("close");
+    });
+
+    // ---- Sensor status accumulation ----
+
+    it("should accumulate multiple status fields for same sensor", () => {
+        monitor.feedData(oyuMsg("OYU:05:BAT:3800:00"));
+        monitor.feedData(oyuMsg("OYU:05:CPU:007200:01"));
+        monitor.feedData(oyuMsg("OYU:05:VER:0002:02"));
+        const status = monitor.getAllSensorStatus().get(5);
+        expect(status).toBeDefined();
+        expect(status!.batteryMv).toBe(3800);
+        expect(status!.cpuUptime).toBe(7200);
+        expect(status!.version).toBe(2);
     });
 });

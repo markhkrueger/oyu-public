@@ -79,9 +79,10 @@ let HOMEKIT_PIN = "000-00-000";
 let HOMEKIT_PORT = 47128;
 let HOMEKIT_USERNAME = "00:00:00:00:00:00";
 
-const DOOR_STILL_OPEN_THRESHOLD = 30; // seconds
+const DOOR_STILL_OPEN_SENTINEL = 99; // protocol value meaning "door left open"
+const VALID_OYU_VERBS = new Set(["OPEN", "CLOSE", "BAT", "CPU", "SER", "VER"]);
 let DOOR_MONITOR_ENABLED = false;
-let DOOR_NAMES: Record<string, string> = {};  // door ID "0"-"9" → display name
+let DOOR_NAMES: Record<string, string> = {};  // sensor ID "0"-"99" → display name
 
 type TempUnits = "C" | "F";
 type FlowUnits = "L" | "G";
@@ -2090,9 +2091,19 @@ interface DoorEvent {
     doorId: number;
     name: string;
     type: "open" | "close";
-    /** Seconds the door was open (for "open" events), DOOR_STILL_OPEN_THRESHOLD means left open. */
+    /** Seconds the door was open (for "open" events), 99 = still open per protocol. */
     openSeconds?: number;
     time: number;
+}
+
+/** Status info from a door sensor (battery, CPU, serial, version). */
+interface SensorStatus {
+    sensorId: number;
+    batteryMv?: number;        // millivolts
+    cpuUptime?: number;        // seconds
+    serialUptime?: number;     // seconds
+    version?: number;          // 0xxx = prod, 1xxx = test
+    lastSeen: number;          // ms timestamp
 }
 
 const SERIAL_DEVICE = "/dev/serial0";
@@ -2102,19 +2113,22 @@ const SERIAL_BAUD = 9600;
  * Monitors door open/close events via a serial wireless module connected
  * to the Raspberry Pi UART (RXD/TXD GPIO pins).
  *
- * Protocol: 9600 baud, messages in the format:
- *   "DOORi:OPENss#dd"  — door i opened for ss seconds, sequence dd (DOOR_STILL_OPEN_THRESHOLD = left open)
- *   "DOORi:CLOSE#dd"   — door i closed, sequence dd
- * Acknowledgement: "ACKi:OPENss#dd" or "ACKi:CLOSE#dd" sent back on receipt.
- * Duplicate sequence numbers (same door, same seq) are ignored.
+ * Protocol: 9600 baud, OYU message format:
+ *   "OYU:ii:VERB:data:seq|xsum\n"
+ * Verbs: OPEN, CLOSE, BAT, CPU, SER, VER
+ * ACK: echo back with "OYU" → "UYO" and recalculated checksum.
+ * Duplicate sequence numbers (same sensor, same seq) are silently discarded.
+ * See door_sensor_protocol.md for full specification.
  */
 class DoorMonitor {
     private serialProcess: ReturnType<typeof spawn> | undefined;
     private buffer = "";
     private readonly events: DoorEvent[] = [];
     private readonly maxEvents = 500;
-    /** Last received sequence number per door ID, for duplicate detection. */
+    /** Last received sequence number per sensor ID, for duplicate detection. */
     private readonly lastSeq = new Map<number, number>();
+    /** Status info per sensor (battery, uptime, version). */
+    private readonly sensorStatus = new Map<number, SensorStatus>();
     public onEvent?: (event: DoorEvent) => void;
 
     /** Start listening on the serial port. Only works on Linux. */
@@ -2242,69 +2256,185 @@ class DoorMonitor {
             .map(([doorId, ev]) => ({ doorId, name: ev.name, lastEvent: ev }));
     }
 
-    /** Send an ACK back over the serial port via shell to preserve tty settings. */
-    private sendAck(ack: string): void {
+    /** Get status info for all known sensors. */
+    public getAllSensorStatus(): ReadonlyMap<number, SensorStatus> {
+        return this.sensorStatus;
+    }
+
+    /** Feed raw serial data into the buffer for processing (used for testing). */
+    public feedData(data: string): void {
+        this.buffer += data;
+        this.parseBuffer();
+    }
+
+    /** Compute XOR checksum of all bytes in a string, returned as 2-digit hex. */
+    public static xorChecksum(data: string): string {
+        let xor = 0;
+        for (let i = 0; i < data.length; i++) {
+            xor ^= data.charCodeAt(i);
+        }
+        return xor.toString(16).padStart(2, "0").toUpperCase();
+    }
+
+    /** Send an ACK back over the serial port via shell to preserve tty settings.
+     *  ACK format: replace "OYU" with "UYO", recalculate checksum. */
+    private sendAck(msgBeforePipe: string): void {
+        const ackBody = "UYO" + msgBeforePipe.slice(3); // replace OYU with UYO
+        const ackXsum = DoorMonitor.xorChecksum(ackBody);
+        const ack = `${ackBody}|${ackXsum}\n`;
         try {
-            execSync(`echo -ne "${ack}" > ${SERIAL_DEVICE}`, { timeout: 2000, stdio: "pipe" });
-            // Re-apply raw mode after shell write
+            execSync(`echo -ne "${ack.replace(/"/g, '\\"')}" > ${SERIAL_DEVICE}`, { timeout: 2000, stdio: "pipe" });
             execSync(`stty -F ${SERIAL_DEVICE} ${SERIAL_BAUD} raw -echo`, { timeout: 2000, stdio: "pipe" });
-            logger.log(LogSeverity.Detail, LogArea.Serial, `door ACK sent: ${ack}`);
+            logger.log(LogSeverity.Detail, LogArea.Serial, `ACK sent: ${ack.trim()}`);
         } catch (e) {
-            logger.logError(LogSeverity.Important, LogArea.Serial, e as Error, "failed to send door ACK");
+            logger.logError(LogSeverity.Important, LogArea.Serial, e as Error, "failed to send ACK");
         }
     }
 
     private parseBuffer(): void {
-        // Match DOOR messages: DOORi:OPENss#dd or DOORi:CLOSE#dd (with optional sequence number)
-        const pattern = /DOOR(\d):(?:(OPEN)(\d{2})|(CLOSE))(?:#(\d{2}))?/g;
-        let match: RegExpExecArray | null;
-        let lastIndex = 0;
-
-        while ((match = pattern.exec(this.buffer)) !== null) {
-            const doorId = parseInt(match[1], 10);
-            const name = DOOR_NAMES[String(doorId)] || `Door ${doorId}`;
-            const now = Date.now();
-            const seqStr = match[5];
-            const hasSeq = seqStr !== undefined;
-            const seq = hasSeq ? parseInt(seqStr, 10) : -1;
-
-            logger.log(LogSeverity.Detail, LogArea.Serial, match.toString());
-
-            // Duplicate detection: if sequence matches the last one for this door, skip
-            if (hasSeq && this.lastSeq.get(doorId) === seq) {
-                logger.log(LogSeverity.Info, LogArea.Serial,
-                    `duplicate door message ignored: door ${doorId} seq ${seq}`);
-                lastIndex = pattern.lastIndex;
-                continue;
+        // Process complete newline-terminated messages from the buffer
+        let nlIdx: number;
+        while ((nlIdx = this.buffer.indexOf("\n")) !== -1) {
+            const line = this.buffer.slice(0, nlIdx).replace(/\r$/, "");
+            this.buffer = this.buffer.slice(nlIdx + 1);
+            if (line.startsWith("OYU:")) {
+                this.processMessage(line);
             }
+        }
+        // Prevent unbounded buffer growth from non-OYU data
+        if (this.buffer.length > 1024) {
+            this.buffer = this.buffer.slice(-256);
+        }
+    }
 
-            // Record sequence number and send ACK
-            if (hasSeq) {
-                this.lastSeq.set(doorId, seq);
-                const ack = match[0].replace("DOOR", "ACK");
-                this.sendAck(ack);
-            }
-
-            if (match[2] === "OPEN") {
-                const seconds = parseInt(match[3], 10);
-                const event: DoorEvent = {
-                    doorId, name, type: "open", openSeconds: seconds, time: now,
-                };
-                this.addEvent(event);
-            } else {
-                const event: DoorEvent = {
-                    doorId, name, type: "close", time: now,
-                };
-                this.addEvent(event);
-            }
-            lastIndex = pattern.lastIndex;
+    /** Validate and process a single OYU protocol message. */
+    private processMessage(line: string): void {
+        // Validate length
+        if (line.length > 32) {
+            logger.log(LogSeverity.Detail, LogArea.Serial, `message too long (${line.length}): ${line}`);
+            return;
         }
 
-        // Keep only unprocessed bytes in the buffer (limit to 1KB to prevent unbounded growth)
-        if (lastIndex > 0) {
-            this.buffer = this.buffer.slice(lastIndex);
-        } else if (this.buffer.length > 1024) {
-            this.buffer = this.buffer.slice(-256);
+        // Split body and checksum on |
+        const pipeIdx = line.indexOf("|");
+        if (pipeIdx === -1) {
+            logger.log(LogSeverity.Detail, LogArea.Serial, `no checksum separator: ${line}`);
+            return;
+        }
+        const body = line.slice(0, pipeIdx);
+        const xsum = line.slice(pipeIdx + 1);
+
+        // Validate checksum
+        const expected = DoorMonitor.xorChecksum(body);
+        if (xsum.toUpperCase() !== expected) {
+            logger.log(LogSeverity.Info, LogArea.Serial,
+                `bad checksum: expected ${expected}, got ${xsum} in: ${line}`);
+            return;
+        }
+
+        // Parse fields: OYU:ii:VERB:data:seq
+        const parts = body.split(":");
+        if (parts.length < 4) {
+            logger.log(LogSeverity.Detail, LogArea.Serial, `too few fields: ${line}`);
+            return;
+        }
+
+        const sensorIdStr = parts[1];
+        const verb = parts[2];
+        if (!/^\d{2}$/.test(sensorIdStr)) {
+            logger.log(LogSeverity.Detail, LogArea.Serial, `invalid sensor ID: ${line}`);
+            return;
+        }
+        if (!VALID_OYU_VERBS.has(verb)) {
+            logger.log(LogSeverity.Detail, LogArea.Serial, `unknown verb "${verb}": ${line}`);
+            return;
+        }
+
+        const sensorId = parseInt(sensorIdStr, 10);
+        const name = DOOR_NAMES[String(sensorId)] || `Sensor ${sensorId}`;
+        const now = Date.now();
+
+        // Extract sequence number (always last field before |)
+        const seqStr = parts[parts.length - 1];
+        if (!/^\d{2}$/.test(seqStr)) {
+            logger.log(LogSeverity.Detail, LogArea.Serial, `invalid seq: ${line}`);
+            return;
+        }
+        const seq = parseInt(seqStr, 10);
+
+        // Duplicate detection
+        if (this.lastSeq.get(sensorId) === seq) {
+            logger.log(LogSeverity.Detail, LogArea.Serial,
+                `duplicate ignored: sensor ${sensorId} seq ${seq}`);
+            return;
+        }
+        this.lastSeq.set(sensorId, seq);
+
+        // Send ACK
+        this.sendAck(body);
+
+        // Data field(s) are between verb and seq
+        const dataFields = parts.slice(3, -1);
+        const data = dataFields.join(":");
+
+        // Ensure sensor status entry exists
+        let status = this.sensorStatus.get(sensorId);
+        if (!status) {
+            status = { sensorId, lastSeen: now };
+            this.sensorStatus.set(sensorId, status);
+        }
+        status.lastSeen = now;
+
+        switch (verb) {
+            case "OPEN": {
+                const seconds = parseInt(data, 10);
+                if (isNaN(seconds) || seconds < 0 || (seconds > 59 && seconds !== DOOR_STILL_OPEN_SENTINEL)) {
+                    logger.log(LogSeverity.Info, LogArea.Serial, `invalid OPEN seconds "${data}": ${line}`);
+                    return;
+                }
+                this.addEvent({ doorId: sensorId, name, type: "open", openSeconds: seconds, time: now });
+                break;
+            }
+            case "CLOSE": {
+                this.addEvent({ doorId: sensorId, name, type: "close", time: now });
+                break;
+            }
+            case "BAT": {
+                const mv = parseInt(data, 10);
+                if (!isNaN(mv)) {
+                    status.batteryMv = mv;
+                    logger.log(LogSeverity.Info, LogArea.Serial,
+                        `sensor ${sensorId} battery: ${mv}mV`);
+                }
+                break;
+            }
+            case "CPU": {
+                const uptime = parseInt(data, 10);
+                if (!isNaN(uptime)) {
+                    status.cpuUptime = uptime;
+                    logger.log(LogSeverity.Detail, LogArea.Serial,
+                        `sensor ${sensorId} CPU uptime: ${uptime}s`);
+                }
+                break;
+            }
+            case "SER": {
+                const uptime = parseInt(data, 10);
+                if (!isNaN(uptime)) {
+                    status.serialUptime = uptime;
+                    logger.log(LogSeverity.Detail, LogArea.Serial,
+                        `sensor ${sensorId} serial uptime: ${uptime}s`);
+                }
+                break;
+            }
+            case "VER": {
+                const ver = parseInt(data, 10);
+                if (!isNaN(ver)) {
+                    status.version = ver;
+                    logger.log(LogSeverity.Info, LogArea.Serial,
+                        `sensor ${sensorId} version: ${ver} (${ver >= 1000 ? "test" : "prod"})`);
+                }
+                break;
+            }
         }
     }
 
@@ -2315,7 +2445,7 @@ class DoorMonitor {
         }
         logger.log(LogSeverity.Info, LogArea.Serial,
             event.type === "open"
-                ? `${event.name} opened (${event.openSeconds}s${event.openSeconds === DOOR_STILL_OPEN_THRESHOLD ? " — left open" : ""})`
+                ? `${event.name} opened (${event.openSeconds}s${event.openSeconds === DOOR_STILL_OPEN_SENTINEL ? " — left open" : ""})`
                 : `${event.name} closed`);
         this.onEvent?.(event);
     }
@@ -2445,10 +2575,9 @@ class SensorManager {
         const doorStates: DoorState[] = this.doorMonitor.getDoorStates().map(d => {
             const openEv = lastOpen.get(d.doorId);
             const openTime = openEv ? openEv.time - (openEv.openSeconds ?? 0) * 1000 : 0;
-            // Door is still open if the latest event is an open at the threshold (no CLOSE followed)
+            // Door is still open if the latest event is OPEN with sentinel value 99 (no CLOSE followed)
             const stillOpen = d.lastEvent.type === "open"
-                && d.lastEvent.openSeconds !== undefined
-                && d.lastEvent.openSeconds >= DOOR_STILL_OPEN_THRESHOLD;
+                && d.lastEvent.openSeconds === DOOR_STILL_OPEN_SENTINEL;
             // If closed after being left open, calculate actual duration from open time to close time
             let lastOpenSeconds = openEv?.openSeconds ?? 0;
             if (d.lastEvent.type === "close" && openEv && openTime > 0) {
@@ -6443,7 +6572,7 @@ class HomeKitBridge {
             if (origCb) { origCb(event); }
             const svc = doorServices.get(event.doorId);
             if (!svc) { return; }
-            const isOpen = event.type === "open" && event.openSeconds === DOOR_STILL_OPEN_THRESHOLD;
+            const isOpen = event.type === "open" && event.openSeconds === DOOR_STILL_OPEN_SENTINEL;
             doorOpen.set(event.doorId, isOpen);
             svc.updateCharacteristic(Characteristic.ContactSensorState,
                 isOpen
@@ -7017,4 +7146,8 @@ export {
     buildCalendarWeekHtml,
     buildCalendarMonthHtml,
     weekSunday,
+    DoorMonitor,
+    DoorEvent,
+    SensorStatus,
+    DOOR_STILL_OPEN_SENTINEL,
 };
