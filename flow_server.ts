@@ -2146,21 +2146,24 @@ class DoorMonitor {
     }
 
     private stopped = false;
+    private restartDelay = 1000;
+    private static readonly MAX_RESTART_DELAY = 30000;
 
-    /** Start cat on the serial device, with auto-restart on exit. */
+    /** Start cat on the serial device, with auto-restart and backoff on exit. */
     private startSerialReader(): void {
-        // Re-apply stty raw before each cat start
+        // Fix permissions and re-apply stty before each start
         try {
-            execSync(`stty -F ${SERIAL_DEVICE} ${SERIAL_BAUD} raw -echo`, { timeout: 5000, stdio: "pipe" });
+            execSync(`sudo chmod 0660 ${SERIAL_DEVICE} 2>/dev/null; sudo chgrp tty ${SERIAL_DEVICE} 2>/dev/null; stty -F ${SERIAL_DEVICE} ${SERIAL_BAUD} raw -echo`,
+                { timeout: 5000, stdio: "pipe" });
         } catch { /* ExecStartPre handles this if we can't */ }
 
         this.serialProcess = spawn("cat", [SERIAL_DEVICE], { stdio: ["ignore", "pipe", "pipe"] });
 
         this.serialProcess.stdout?.on("data", (chunk: Buffer) => {
             const data = chunk.toString("utf-8");
-            //logger.log(LogSeverity.Detail, LogArea.Serial,`serial rx (${chunk.length} bytes): ${JSON.stringify(data)}`);
             this.buffer += data;
             this.parseBuffer();
+            this.restartDelay = 1000; // reset backoff on successful data
         });
 
         this.serialProcess.stderr?.on("data", (chunk: Buffer) => {
@@ -2177,10 +2180,12 @@ class DoorMonitor {
             this.serialProcess = undefined;
             if (this.stopped) { return; }
             logger.log(LogSeverity.Info, LogArea.Serial,
-                `serial reader exited with code ${code}, restarting in 1s`);
+                `serial reader exited with code ${code}, restarting in ${this.restartDelay / 1000}s`);
             setTimeout(() => {
                 if (!this.stopped) { this.startSerialReader(); }
-            }, 1000);
+            }, this.restartDelay);
+            // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s max
+            this.restartDelay = Math.min(this.restartDelay * 2, DoorMonitor.MAX_RESTART_DELAY);
         });
     }
 

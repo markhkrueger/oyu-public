@@ -44,17 +44,22 @@ Also edit `/boot/firmware/cmdline.txt` and remove any `console=serial0` or `cons
     sudo udevadm control --reload-rules
     sudo udevadm trigger /dev/ttyS0
 
-**4. Reboot** to apply all changes:
+**4. Allow the server to fix permissions at runtime** — the device permissions can be reset by udev at any time. Add a sudoers rule so the service can re-apply them without a password:
+
+    echo "$USER ALL=(root) NOPASSWD: /bin/chmod 0660 /dev/ttyS0, /bin/chgrp tty /dev/ttyS0" | sudo tee /etc/sudoers.d/serial-access
+    sudo chmod 0440 /etc/sudoers.d/serial-access
+
+**5. Reboot** to apply all changes:
 
     sudo reboot
 
-**5. Verify** the serial port is accessible and receiving data:
+**6. Verify** the serial port is accessible and receiving data:
 
     ls -la /dev/ttyS0          # should show crw-rw---- ... root tty
     stty -F /dev/serial0 9600 raw -echo
     cat /dev/serial0            # should show incoming data without permission errors
 
-Note: the `flow-server.service` file includes an `ExecStartPre` command that sets permissions and configures the serial port baud rate as root before starting the server, as a safeguard against permissions being reset.
+Note: the `flow-server.service` includes an `ExecStartPre` command that sets permissions as root before starting the server. The server also re-applies permissions via `sudo` before each serial reader start, with exponential backoff if the device is unavailable.
 
 Also disable camera and display auto-detection, which can conflict with the 1-wire overlay. This system runs headless and doesn't use a camera or display, so comment these out:
 
