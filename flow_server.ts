@@ -2153,7 +2153,7 @@ class DoorMonitor {
     private startSerialReader(): void {
         // Fix permissions and re-apply stty before each start
         try {
-            execSync(`sudo chmod 0660 ${SERIAL_DEVICE} 2>/dev/null; sudo chgrp tty ${SERIAL_DEVICE} 2>/dev/null; stty -F ${SERIAL_DEVICE} ${SERIAL_BAUD} raw -echo`,
+            execSync(`sudo chmod 0660 /dev/ttyS0 2>/dev/null; sudo chgrp tty /dev/ttyS0 2>/dev/null; sudo stty -F ${SERIAL_DEVICE} ${SERIAL_BAUD} raw -echo`,
                 { timeout: 5000, stdio: "pipe" });
         } catch { /* ExecStartPre handles this if we can't */ }
 
@@ -2206,7 +2206,7 @@ class DoorMonitor {
             // Node file I/O which resets terminal settings on tty devices
             try {
                 execSync(
-                    `echo -ne "AT+C${channel}\\r\\n" > ${SERIAL_DEVICE}`,
+                    `printf 'AT+C${channel}\\r\\n' > ${SERIAL_DEVICE}`,
                     { timeout: 2000, stdio: "pipe" });
                 execSync("sleep 0.2", { timeout: 2000 });
             } catch { /* best effort */ }
@@ -2225,7 +2225,7 @@ class DoorMonitor {
             } catch { /* best effort */ }
             // Re-apply raw mode — the echo/shell commands above reset terminal settings
             try {
-                execSync(`stty -F ${SERIAL_DEVICE} ${SERIAL_BAUD} raw -echo`,
+                execSync(`sudo stty -F ${SERIAL_DEVICE} ${SERIAL_BAUD} raw -echo`,
                     { timeout: 5000, stdio: "pipe" });
             } catch (e) {
                 logger.logError(LogSeverity.Important, LogArea.Serial, e as Error,
@@ -2281,15 +2281,14 @@ class DoorMonitor {
         return xor.toString(16).padStart(2, "0").toUpperCase();
     }
 
-    /** Send an ACK back over the serial port via shell to preserve tty settings.
+    /** Send an ACK back over the serial port.
      *  ACK format: replace "OYU" with "UYO", recalculate checksum. */
     private sendAck(msgBeforePipe: string): void {
         const ackBody = "UYO" + msgBeforePipe.slice(3); // replace OYU with UYO
         const ackXsum = DoorMonitor.xorChecksum(ackBody);
         const ack = `${ackBody}|${ackXsum}\n`;
         try {
-            execSync(`echo -ne "${ack.replace(/"/g, '\\"')}" > ${SERIAL_DEVICE}`, { timeout: 2000, stdio: "pipe" });
-            execSync(`stty -F ${SERIAL_DEVICE} ${SERIAL_BAUD} raw -echo`, { timeout: 2000, stdio: "pipe" });
+            execSync(`printf '%s' "${ack.replace(/"/g, '\\"')}" > ${SERIAL_DEVICE}`, { timeout: 2000, stdio: "pipe" });
             logger.log(LogSeverity.Detail, LogArea.Serial, `ACK sent: ${ack.trim()}`);
         } catch (e) {
             logger.logError(LogSeverity.Important, LogArea.Serial, e as Error, "failed to send ACK");

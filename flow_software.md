@@ -27,12 +27,15 @@ The serial port is only required if your hardware includes the HC12 transceiver 
 
 The serial port requires several configuration steps:
 
-**1. Disable the serial console login shell** — by default, `agetty` runs on the serial port and will consume all incoming data:
+**1. Disable the serial console** — by default, the kernel and a login shell use the serial port, which will interfere with HC12 communication:
 
     sudo systemctl stop serial-getty@ttyS0.service
     sudo systemctl disable serial-getty@ttyS0.service
+    sudo systemctl mask serial-getty@ttyS0.service
 
-Also edit `/boot/firmware/cmdline.txt` and remove any `console=serial0` or `console=ttyS0` entries if present. Keep `console=tty1`.
+The `mask` prevents the service from being re-enabled automatically.
+
+Also edit `/boot/firmware/cmdline.txt` and remove `console=serial0,115200` (or any `console=serial0` or `console=ttyS0` entry). This stops the kernel from sending console output to the serial port. Keep `console=tty1`.
 
 **2. Add your user to the serial port groups:**
 
@@ -46,7 +49,7 @@ Also edit `/boot/firmware/cmdline.txt` and remove any `console=serial0` or `cons
 
 **4. Allow the server to fix permissions at runtime** — the device permissions can be reset by udev at any time. Add a sudoers rule so the service can re-apply them without a password:
 
-    echo "$USER ALL=(root) NOPASSWD: /bin/chmod 0660 /dev/ttyS0, /bin/chgrp tty /dev/ttyS0" | sudo tee /etc/sudoers.d/serial-access
+    echo "$USER ALL=(root) NOPASSWD: /bin/chmod 0660 /dev/ttyS0, /bin/chgrp tty /dev/ttyS0, /bin/stty -F /dev/serial0 *" | sudo tee /etc/sudoers.d/serial-access
     sudo chmod 0440 /etc/sudoers.d/serial-access
 
 **5. Reboot** to apply all changes:
