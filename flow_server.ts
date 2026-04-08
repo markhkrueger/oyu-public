@@ -859,10 +859,12 @@ class HistoryStore {
                 hotPumpCount++;
             }
         }
-        stats.avgTemps = Object.entries(tempSums).map(([name, { sum, count }]) => ({
-            name,
-            avgCelsius: Math.round((sum / count) * 10) / 10,
-        }));
+        stats.avgTemps = Object.entries(tempSums)
+            .filter(([name]) => !/^Sensor \d+$/.test(name))
+            .map(([name, { sum, count }]) => ({
+                name,
+                avgCelsius: Math.round((sum / count) * 10) / 10,
+            }));
         if (hotPumpCount > 0) {
             stats.hotAvgWhilePumping = Math.round((hotPumpSum / hotPumpCount) * 10) / 10;
         }
@@ -1356,15 +1358,19 @@ class StatsAccumulator {
     }
 
     public toSummary(): DaySummary {
-        const avgTemps = Object.entries(this.tempSums).map(([name, { sum, count }]) => ({
-            name,
-            avgCelsius: count > 0 ? Math.round((sum / count) * 10) / 10 : 0,
-        }));
-        const tempRanges = Object.entries(this.tempRanges).map(([name, { min, max }]) => ({
-            name,
-            minCelsius: Math.round(min * 10) / 10,
-            maxCelsius: Math.round(max * 10) / 10,
-        }));
+        const avgTemps = Object.entries(this.tempSums)
+            .filter(([name]) => !/^Sensor \d+$/.test(name))
+            .map(([name, { sum, count }]) => ({
+                name,
+                avgCelsius: count > 0 ? Math.round((sum / count) * 10) / 10 : 0,
+            }));
+        const tempRanges = Object.entries(this.tempRanges)
+            .filter(([name]) => !/^Sensor \d+$/.test(name))
+            .map(([name, { min, max }]) => ({
+                name,
+                minCelsius: Math.round(min * 10) / 10,
+                maxCelsius: Math.round(max * 10) / 10,
+            }));
         return {
             date: this.currentDate,
             flowLiters: Math.round(this.totalFlowLiters * 10) / 10,
@@ -4177,7 +4183,7 @@ ${summary?.avgTemps && summary.avgTemps.length > 0 ? `<div class="card">
   <h2>${L("calendarTemperatures")}</h2>
   <table>
     <tr><td></td><td class="muted">${L("calendarTempAvg")}</td><td class="muted">${L("calendarTempMin")}</td><td class="muted">${L("calendarTempMax")}</td></tr>
-    ${summary.avgTemps.map((t) => {
+    ${summary.avgTemps.filter((t) => !/^Sensor \d+$/.test(t.name)).map((t) => {
         const range = summary.tempRanges?.find((r) => r.name === t.name);
         return `<tr><td>${t.name}</td><td class="val">${formatTemp(t.avgCelsius)}</td><td class="val">${range ? formatTemp(range.minCelsius) : "--"}</td><td class="val">${range ? formatTemp(range.maxCelsius) : "--"}</td></tr>`;
     }).join("\n    ")}
