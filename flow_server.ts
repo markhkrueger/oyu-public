@@ -80,6 +80,7 @@ let HOMEKIT_PORT = 47128;
 let HOMEKIT_USERNAME = "00:00:00:00:00:00";
 
 const DOOR_STILL_OPEN_SENTINEL = 99; // protocol value meaning "door left open"
+const DOOR_OPEN_REPORT_DELAY = 60;   // seconds the sensor waits before sending OPEN:99
 const VALID_OYU_VERBS = new Set(["OPEN", "CLOSE", "BAT", "CPU", "SER", "VER"]);
 let DOOR_MONITOR_ENABLED = false;
 let DOOR_NAMES: Record<string, string> = {};  // sensor ID "0"-"99" → display name
@@ -973,6 +974,17 @@ class DoorHistoryStore {
     }
 
     /** Get all unique door IDs that have history. */
+    /** Get the most recent battery reading for a door from history. */
+    public getLastBattery(doorId: number): number | undefined {
+        // Search backwards (most recent first) for this door's battery
+        for (let i = this.days.length - 1; i >= 0; i--) {
+            if (this.days[i].doorId === doorId && this.days[i].lastBatteryMv !== undefined) {
+                return this.days[i].lastBatteryMv;
+            }
+        }
+        return undefined;
+    }
+
     public getDoorIds(): number[] {
         const ids = new Set<number>();
         for (const d of this.days) { ids.add(d.doorId); }
@@ -2755,7 +2767,8 @@ class SensorManager {
         const sensorStatuses = this.doorMonitor.getAllSensorStatus();
         const doorStates: DoorState[] = this.doorMonitor.getDoorStates().map(d => {
             const openEv = lastOpen.get(d.doorId);
-            const openTime = openEv ? openEv.time - (openEv.openSeconds ?? 0) * 1000 : 0;
+            const openOffset = openEv?.openSeconds === DOOR_STILL_OPEN_SENTINEL ? DOOR_OPEN_REPORT_DELAY : (openEv?.openSeconds ?? 0);
+            const openTime = openEv ? openEv.time - openOffset * 1000 : 0;
             // Door is still open if the latest event is OPEN with sentinel value 99 (no CLOSE followed)
             const stillOpen = d.lastEvent.type === "open"
                 && d.lastEvent.openSeconds === DOOR_STILL_OPEN_SENTINEL;
@@ -2771,7 +2784,7 @@ class SensorManager {
                 lastOpenTime: openTime,
                 lastOpenSeconds,
                 stillOpen,
-                batteryMv: sensorInfo?.batteryMv,
+                batteryMv: sensorInfo?.batteryMv ?? this.doorHistoryStore.getLastBattery(d.doorId),
             };
         });
         return {
@@ -4668,6 +4681,16 @@ function getAvailableLocales(): { id: string; label: string }[] {
 
 // ---- Door History Page ----
 
+const DOORS_REFRESH_SCRIPT = `<script>
+var doorVer = null;
+setInterval(function() {
+  fetch("/api/doors/version").then(function(r) { return r.json(); }).then(function(data) {
+    if (doorVer === null) { doorVer = data.version; }
+    else if (data.version !== doorVer) { location.reload(); }
+  }).catch(function() {});
+}, 5000);
+</script>`;
+
 const DOORS_PAGE_CSS = `
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
@@ -4748,32 +4771,74 @@ function buildDoorsDayHtml(
     const canPrev = prevStr >= oldestDate;
     const canNext = nextStr <= latestDate;
 
-    // Merge events from all matching summaries, sorted by time
-    const allEvents: (PersistedDoorEvent & { name: string })[] = [];
-    let totalOpens = 0;
-    let totalSeconds = 0;
+    // Merge events from all matching summaries, sorted by time, grouped by door
+    const eventsByDoor = new Map<number, (PersistedDoorEvent & { name: string; doorId: number })[]>();
     for (const s of daySummaries) {
-        totalOpens += s.openCount;
-        totalSeconds += s.totalOpenSeconds;
         for (const ev of s.events) {
-            allEvents.push({ ...ev, name: s.name });
+            const list = eventsByDoor.get(s.doorId) || [];
+            list.push({ ...ev, name: s.name, doorId: s.doorId });
+            eventsByDoor.set(s.doorId, list);
         }
     }
-    allEvents.sort((a, b) => a.time - b.time);
+
+    // Consolidate into open periods per door using a state machine
+    interface OpenPeriod { name: string; openTime: number; durationSeconds: number; stillOpen: boolean }
+    const periods: OpenPeriod[] = [];
+    for (const [, events] of eventsByDoor) {
+        events.sort((a, b) => a.time - b.time);
+        let pendingOpen: { name: string; openTime: number } | undefined;
+        for (const ev of events) {
+            if (ev.type === "open") {
+                // If there's a pending open without a close, close it at this event's time
+                if (pendingOpen) {
+                    const dur = Math.round((ev.time - pendingOpen.openTime) / 1000);
+                    periods.push({ name: pendingOpen.name, openTime: pendingOpen.openTime, durationSeconds: dur, stillOpen: false });
+                    pendingOpen = undefined;
+                }
+                const openSeconds = ev.openSeconds ?? 0;
+                const offsetSeconds = openSeconds === DOOR_STILL_OPEN_SENTINEL ? DOOR_OPEN_REPORT_DELAY : openSeconds;
+                const openTime = ev.time - offsetSeconds * 1000;
+                if (openSeconds !== DOOR_STILL_OPEN_SENTINEL) {
+                    // Quick open/close — complete period
+                    periods.push({ name: ev.name, openTime, durationSeconds: openSeconds, stillOpen: false });
+                } else {
+                    // Left open — wait for close
+                    pendingOpen = { name: ev.name, openTime };
+                }
+            } else if (ev.type === "close" && pendingOpen) {
+                const dur = Math.round((ev.time - pendingOpen.openTime) / 1000);
+                periods.push({ name: pendingOpen.name, openTime: pendingOpen.openTime, durationSeconds: dur, stillOpen: false });
+                pendingOpen = undefined;
+            }
+        }
+        // If there's still a pending open at the end, it's still open
+        if (pendingOpen) {
+            periods.push({ name: pendingOpen.name, openTime: pendingOpen.openTime, durationSeconds: 0, stillOpen: true });
+        }
+    }
+    periods.sort((a, b) => a.openTime - b.openTime);
+
+    let totalOpens = periods.length;
+    let totalSeconds = periods.reduce((sum, p) => sum + p.durationSeconds, 0);
 
     let eventRows = "";
-    if (allEvents.length === 0) {
+    if (periods.length === 0) {
         eventRows = `<tr><td colspan="4" class="muted">${L("doorsNoEvents")}</td></tr>`;
     } else {
-        for (const ev of allEvents) {
-            const timeStr = formatClockHMS(ev.time);
-            const typeStr = ev.type === "open"
-                ? (ev.openSeconds === DOOR_STILL_OPEN_SENTINEL
-                    ? `<span class="open-row">${L("doorStillOpen")}</span>`
-                    : `${L("doorOpenDuration", { duration: `${ev.openSeconds}s` })}`)
-                : L("doorClosed");
-            const nameCol = selectedDoor === "all" ? `<td>${ev.name}</td>` : "";
-            eventRows += `<tr>${nameCol}<td>${timeStr}</td><td>${typeStr}</td></tr>\n`;
+        for (let pi = 0; pi < periods.length; pi++) {
+            const p = periods[pi];
+            const isLast = pi === periods.length - 1;
+            const timeStr = formatClockHMS(p.openTime);
+            let durStr: string;
+            if (p.stillOpen && isLast) {
+                durStr = `<span class="open-row">${L("doorStillOpen")}</span>`;
+            } else if (p.durationSeconds === 0) {
+                durStr = `<span class="muted">--</span>`;
+            } else {
+                durStr = formatDuration(p.durationSeconds * 1000);
+            }
+            const nameCol = selectedDoor === "all" ? `<td>${p.name}</td>` : "";
+            eventRows += `<tr>${nameCol}<td>${timeStr}</td><td>${durStr}</td></tr>\n`;
         }
     }
 
@@ -4810,6 +4875,7 @@ ${doorsPageHeader(doorIds, selectedDoor, "day", date)}
   </table>
 </div>
 <p class="footer"><a href="/">${L("doorsBackToDashboard")}</a></p>
+${DOORS_REFRESH_SCRIPT}
 </body>
 </html>`;
 }
@@ -4909,6 +4975,7 @@ ${doorsPageHeader(doorIds, selectedDoor, "week", anchorDate)}
   </table>
 </div>
 <p class="footer"><a href="/">${L("doorsBackToDashboard")}</a></p>
+${DOORS_REFRESH_SCRIPT}
 </body>
 </html>`;
 }
@@ -5011,6 +5078,7 @@ ${doorsPageHeader(doorIds, selectedDoor, "month", anchorDate)}
   </table>
 </div>
 <p class="footer"><a href="/">${L("doorsBackToDashboard")}</a></p>
+${DOORS_REFRESH_SCRIPT}
 </body>
 </html>`;
 }
@@ -6374,6 +6442,17 @@ class FlowHttpServer {
             case "/api/cards":
                 this.sendDashboardCards(res);
                 break;
+
+            case "/api/doors/version": {
+                // Lightweight endpoint: returns event count + battery hash for change detection
+                const allDoorDays = this.sensors.doorHistoryStore.getAllDays();
+                let hash = 0;
+                for (const d of allDoorDays) {
+                    hash += d.events.length + (d.lastBatteryMv ?? 0);
+                }
+                this.sendJson(res, 200, { version: hash });
+                break;
+            }
 
             case "/api/log": {
                 const dateParam = parsed.searchParams.get("date");
