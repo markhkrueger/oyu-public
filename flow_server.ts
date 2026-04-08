@@ -35,7 +35,7 @@ Endpoints:
 
 */
 
-const VERSION = "1.0.8";
+const VERSION = "1.0.9";
 
 // ---- Constants ----
 
@@ -90,11 +90,13 @@ let TEMP_UNITS: TempUnits = "C";
 let FLOW_UNITS: FlowUnits = "L";
 
 let LOCALE_ID = "en";
+let TIME_FORMAT: "12" | "24" = "24";
 
 const IS_LINUX = process.platform !== "darwin" && process.platform !== "win32";
 
 let LOG_FILE = "flow.log";
 let HISTORY_FILE = "flow_history.json";
+let DOOR_HISTORY_FILE = "door_history.json";
 let LOG_MAX_ROTATIONS = 30;
 let LOG_MAX_SIZE = 10 * 1024 * 1024; // 10 MB
 let TEMP_LOG_THRESHOLD = 0.5; // °C delta to trigger a log entry
@@ -114,6 +116,7 @@ interface FlowConfig {
     pumpPin?: number;
     logFile?: string;
     historyFile?: string;
+    doorHistoryFile?: string;
     logMaxRotations?: number;
     logMaxSize?: number;
     tempLogThreshold?: number;
@@ -126,6 +129,7 @@ interface FlowConfig {
     tempUnits?: TempUnits;
     flowUnits?: FlowUnits;
     locale?: string;
+    timeFormat?: "12" | "24";
     pumpWatts?: number;
     heaterWatts?: number;
     heaterTempSetting?: number;
@@ -163,6 +167,7 @@ function applyConfig(cfg: FlowConfig): void {
     if (cfg.pumpPin !== undefined) { PUMP_PIN = cfg.pumpPin; }
     if (cfg.logFile !== undefined) { LOG_FILE = cfg.logFile; }
     if (cfg.historyFile !== undefined) { HISTORY_FILE = cfg.historyFile; }
+    if (cfg.doorHistoryFile !== undefined) { DOOR_HISTORY_FILE = cfg.doorHistoryFile; }
     if (cfg.logMaxRotations !== undefined) { LOG_MAX_ROTATIONS = cfg.logMaxRotations; }
     if (cfg.logMaxSize !== undefined) { LOG_MAX_SIZE = cfg.logMaxSize; }
     if (cfg.tempLogThreshold !== undefined) { TEMP_LOG_THRESHOLD = cfg.tempLogThreshold; }
@@ -178,6 +183,7 @@ function applyConfig(cfg: FlowConfig): void {
     if (LOCALE.tempUnits !== undefined) { TEMP_UNITS = LOCALE.tempUnits; }
     if (LOCALE.flowUnits !== undefined) { FLOW_UNITS = LOCALE.flowUnits; }
     // Explicit config overrides locale defaults
+    if (cfg.timeFormat !== undefined) { TIME_FORMAT = cfg.timeFormat; }
     if (cfg.tempUnits !== undefined) { TEMP_UNITS = cfg.tempUnits; }
     if (cfg.flowUnits !== undefined) { FLOW_UNITS = cfg.flowUnits; }
     if (cfg.pumpWatts !== undefined) { PUMP_WATTS = cfg.pumpWatts; }
@@ -230,7 +236,8 @@ const DEFAULT_LOCALE: LocaleStrings = {
     settingDoorMonitor: "Door monitor", settingDoorEnabled: "Enabled", settingDoorDisabled: "Disabled",
     settingDoorHomekitWarning: "Changing this setting requires re-pairing with HomeKit to update accessories.",
     settingDoorName: "Door {id} name", settingDoorNamePlaceholder: "Not configured",
-    settingLocale: "Language", settingTempUnits: "Temperature units", settingFlowUnits: "Flow units",
+    settingLocale: "Language", settingTimeFormat: "Time format", settingTime12: "12-hour (AM/PM)", settingTime24: "24-hour",
+    settingTempUnits: "Temperature units", settingFlowUnits: "Flow units",
     settingTempC: "Celsius (\u00b0C)", settingTempF: "Fahrenheit (\u00b0F)",
     settingFlowL: "Liters (L/min)", settingFlowG: "Gallons (gal/min)",
     settingSave: "Save", settingsSaved: "Settings saved.",
@@ -288,7 +295,13 @@ const DEFAULT_LOCALE: LocaleStrings = {
     wifiTurnOn: "Turn on Wi-Fi",
     wifiOff: "Wi-Fi is turned off. Connected via Ethernet.",
     doors: "Doors", doorNoEvents: "No door events",
-    doorOpenDuration: "open {duration}", doorStillOpen: "still open",
+    doorOpenDuration: "open {duration}", doorStillOpen: "still open", doorClosed: "closed",
+    doorBattery: "Battery", doorBatteryUnknown: "unknown",
+    doorsHistory: "Door History", doorsHistoryTitle: "Door History",
+    doorsDay: "Day", doorsWeek: "Week", doorsMonth: "Month",
+    doorsAllDoors: "All doors", doorsOpenCount: "Opens", doorsTotalTime: "Total open",
+    doorsNoEvents: "No events", doorsTime: "Time", doorsDuration: "Duration",
+    doorsBackToDashboard: "Back to dashboard",
     log: "Log", logTitle: "System Log", logBackToDashboard: "Back to dashboard",
     logEmpty: "No log entries.", logFilter: "Level:", logArea: "Area:", logFilterAll: "All",
     logFilterInfo: "Info and above", logFilterImportant: "Important and above",
@@ -387,6 +400,7 @@ interface DoorState {
     lastOpenTime: number;      // ms timestamp when door last opened (0 = never)
     lastOpenSeconds: number;   // how long it was open
     stillOpen: boolean;        // true if door is currently open (no CLOSE received)
+    batteryMv?: number;        // last reported battery voltage in millivolts
 }
 
 interface StatusResponse {
@@ -860,6 +874,126 @@ class HistoryStore {
 
     public getDay(date: string): DaySummary | undefined {
         return this.days.find((d) => d.date === date);
+    }
+}
+
+// ---- Door History ----
+
+interface PersistedDoorEvent {
+    time: number;
+    type: "open" | "close";
+    openSeconds?: number;
+}
+
+interface DoorDaySummary {
+    date: string;
+    doorId: number;
+    name: string;
+    openCount: number;
+    totalOpenSeconds: number;
+    lastBatteryMv?: number;
+    events: PersistedDoorEvent[];
+}
+
+class DoorHistoryStore {
+    private days: DoorDaySummary[] = [];
+
+    constructor(private readonly filePath: string) {
+        if (!existsSync(this.filePath)) {
+            writeFileSync(this.filePath, "[]");
+        }
+        this.load();
+    }
+
+    private load(): void {
+        try {
+            if (existsSync(this.filePath)) {
+                const raw = readFileSync(this.filePath, "utf-8");
+                const parsed = JSON.parse(raw);
+                if (Array.isArray(parsed)) { this.days = parsed; }
+            }
+        } catch (e) {
+            logger.logError(LogSeverity.Severe, LogArea.Server, e as Error, "Failed to load door history");
+            this.days = [];
+        }
+    }
+
+    /** Record a door event into today's summary for the given door. */
+    public recordEvent(event: DoorEvent, batteryMv?: number): void {
+        const today = dateString();
+        let summary = this.days.find(d => d.date === today && d.doorId === event.doorId);
+        if (!summary) {
+            summary = {
+                date: today, doorId: event.doorId, name: event.name,
+                openCount: 0, totalOpenSeconds: 0, events: []
+            };
+            this.days.push(summary);
+        }
+        summary.name = event.name;
+        summary.events.push({
+            time: event.time,
+            type: event.type,
+            openSeconds: event.openSeconds,
+        });
+        if (event.type === "open" && event.openSeconds !== undefined) {
+            summary.openCount++;
+            if (event.openSeconds !== DOOR_STILL_OPEN_SENTINEL) {
+                summary.totalOpenSeconds += event.openSeconds;
+            }
+        }
+        if (batteryMv !== undefined) { summary.lastBatteryMv = batteryMv; }
+        // Trim to 90 days
+        const cutoff = new Date();
+        cutoff.setDate(cutoff.getDate() - 90);
+        const cutoffStr = dateString(cutoff.getTime());
+        this.days = this.days.filter(d => d.date >= cutoffStr);
+        this.save();
+    }
+
+    /** Update battery voltage for a door on today's summary. */
+    public updateBattery(doorId: number, batteryMv: number, name: string): void {
+        const today = dateString();
+        let summary = this.days.find(d => d.date === today && d.doorId === doorId);
+        if (!summary) {
+            summary = { date: today, doorId, name, openCount: 0, totalOpenSeconds: 0, events: [] };
+            this.days.push(summary);
+        }
+        summary.lastBatteryMv = batteryMv;
+        this.save();
+    }
+
+    public getAllDays(): readonly DoorDaySummary[] { return this.days; }
+
+    public getDaysForDoor(doorId: number): DoorDaySummary[] {
+        return this.days.filter(d => d.doorId === doorId);
+    }
+
+    public getDay(date: string, doorId?: number): DoorDaySummary[] {
+        return this.days.filter(d => d.date === date && (doorId === undefined || d.doorId === doorId));
+    }
+
+    /** Get all unique door IDs that have history. */
+    public getDoorIds(): number[] {
+        const ids = new Set<number>();
+        for (const d of this.days) { ids.add(d.doorId); }
+        return Array.from(ids).sort((a, b) => a - b);
+    }
+
+    private savePromise: Promise<void> = Promise.resolve();
+
+    private save(): void {
+        this.savePromise = this.savePromise.then(() => this.saveAsync()).catch((e) => {
+            logger.logError(LogSeverity.Severe, LogArea.Server, e as Error, "Failed to save door history");
+        });
+    }
+
+    public flush(): Promise<void> { return this.savePromise; }
+
+    private async saveAsync(): Promise<void> {
+        const tmp = this.filePath + ".tmp";
+        const json = JSON.stringify(this.days);
+        await writeFile(tmp, json);
+        await rename(tmp, this.filePath);
     }
 }
 
@@ -2505,6 +2639,7 @@ class SensorManager {
     public onChange?: () => void;
     public readonly activityLogger: ActivityLogger;
     public readonly historyStore: HistoryStore;
+    public readonly doorHistoryStore: DoorHistoryStore;
     public readonly statsAccumulator: StatsAccumulator;
 
     constructor(logDir?: string) {
@@ -2512,6 +2647,7 @@ class SensorManager {
         const dir = logDir || ".";
         this.activityLogger = new ActivityLogger(dir);
         this.historyStore = new HistoryStore(join(dir, HISTORY_FILE));
+        this.doorHistoryStore = new DoorHistoryStore(join(dir, DOOR_HISTORY_FILE));
         this.statsAccumulator = new StatsAccumulator(this.activityLogger, this.historyStore);
 
         this.temperature = new TemperatureManager();
@@ -2563,6 +2699,11 @@ class SensorManager {
             };
         }
 
+        this.doorMonitor.onEvent = (event) => {
+            const sensorInfo = this.doorMonitor.getAllSensorStatus().get(event.doorId);
+            this.doorHistoryStore.recordEvent(event, sensorInfo?.batteryMv);
+        };
+
         this.pumpController.onTick = () => {
             const temps = this.temperature.getAllReadings().map((r) => ({
                 name: r.name,
@@ -2611,6 +2752,7 @@ class SensorManager {
         for (const ev of this.doorMonitor.getRecentEvents(500)) {
             if (ev.type === "open") { lastOpen.set(ev.doorId, ev); }
         }
+        const sensorStatuses = this.doorMonitor.getAllSensorStatus();
         const doorStates: DoorState[] = this.doorMonitor.getDoorStates().map(d => {
             const openEv = lastOpen.get(d.doorId);
             const openTime = openEv ? openEv.time - (openEv.openSeconds ?? 0) * 1000 : 0;
@@ -2622,12 +2764,14 @@ class SensorManager {
             if (d.lastEvent.type === "close" && openEv && openTime > 0) {
                 lastOpenSeconds = Math.round((d.lastEvent.time - openTime) / 1000);
             }
+            const sensorInfo = sensorStatuses.get(d.doorId);
             return {
                 doorId: d.doorId,
                 name: d.name,
                 lastOpenTime: openTime,
                 lastOpenSeconds,
                 stillOpen,
+                batteryMv: sensorInfo?.batteryMv,
             };
         });
         return {
@@ -2809,6 +2953,22 @@ class NetworkStatus {
 
 
 // ---- Dashboard HTML ----
+
+/** Format a timestamp as HH:MM or h:MM AM/PM based on TIME_FORMAT setting. */
+function formatTimeHM(t: number | Date): string {
+    const d = t instanceof Date ? t : new Date(t);
+    return d.toLocaleTimeString(LOCALE.langCode, {
+        hour: "2-digit", minute: "2-digit", hour12: TIME_FORMAT === "12",
+    });
+}
+
+/** Format a timestamp as HH:MM:SS or h:MM:SS AM/PM based on TIME_FORMAT setting. */
+function formatClockHMS(t: number | Date): string {
+    const d = t instanceof Date ? t : new Date(t);
+    return d.toLocaleTimeString(LOCALE.langCode, {
+        hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: TIME_FORMAT === "12",
+    });
+}
 
 function formatDuration(ms: number): string {
     const secs = Math.floor(ms / 1000);
@@ -3301,27 +3461,37 @@ refreshTimer = setInterval(refreshLog, 5000);
 </html>`;
 }
 
+function batteryIcon(mv: number | undefined): string {
+    if (mv === undefined) { return `<span class="muted">${L("doorBatteryUnknown")}</span>`; }
+    // Typical Li-ion/LiPo: 4200mV = full, 3000mV = empty
+    const pct = Math.max(0, Math.min(100, Math.round((mv - 3000) / 12)));
+    const color = pct > 50 ? "#22c55e" : pct > 20 ? "#f59e0b" : "#ef4444";
+    const volts = (mv / 1000).toFixed(2);
+    return `<span style="color:${color}" title="${volts}V">${pct}%</span>`;
+}
+
 function buildDoorCardHtml(status: StatusResponse): string {
     if (status.doors.length === 0) {
         return `  <div id="card-door" class="card">
-    <h2>${L("doors")}</h2>
+    <h2><a href="/doors" style="color:inherit;text-decoration:none">${L("doors")}</a></h2>
     <table><tr><td class="muted">${L("doorNoEvents")}</td></tr></table>
   </div>`;
     }
     const rows = status.doors.map(d => {
+        const bat = `<td class="muted ago">${batteryIcon(d.batteryMv)}</td>`;
         if (d.lastOpenTime === 0) {
-            return `<tr><td>${d.name}</td><td class="muted">${L("doorNoEvents")}</td></tr>`;
+            return `<tr><td>${d.name}</td><td class="muted">${L("doorNoEvents")}</td><td></td>${bat}</tr>`;
         }
-        const timeStr = new Date(d.lastOpenTime).toLocaleTimeString(LOCALE.langCode, { hour: "2-digit", minute: "2-digit" });
+        const timeStr = formatTimeHM(d.lastOpenTime);
         if (d.stillOpen) {
             const openFor = formatDuration(status.time - d.lastOpenTime);
-            return `<tr><td>${d.name}</td><td class="val flow-active">${L("doorStillOpen")}</td><td class="muted ago">${timeStr} (${openFor})</td></tr>`;
+            return `<tr><td>${d.name}</td><td class="val flow-active">${L("doorStillOpen")}</td><td class="muted ago">${timeStr} (${openFor})</td>${bat}</tr>`;
         }
         const duration = L("doorOpenDuration", { duration: `${d.lastOpenSeconds}s` });
-        return `<tr><td>${d.name}</td><td class="val">${timeStr}</td><td class="muted ago">${duration}</td></tr>`;
+        return `<tr><td>${d.name}</td><td class="val">${timeStr}</td><td class="muted ago">${duration}</td>${bat}</tr>`;
     }).join("\n");
     return `  <div id="card-door" class="card">
-    <h2>${L("doors")}</h2>
+    <h2><a href="/doors" style="color:inherit;text-decoration:none">${L("doors")}</a></h2>
     <table>${rows}</table>
   </div>`;
 }
@@ -3474,7 +3644,7 @@ ${homekitQrSvg ? `  <div id="card-homekit" class="card">
     <p class="muted" style="text-align:center;margin-top:8px">${L("pinLabel", { pin: HOMEKIT_PIN })}</p>
   </div>` : ""}
 </div>
-<div id="bar-uptime" class="uptime">${L("started")} <span>${startDate.toLocaleString(LOCALE.langCode)}</span> &mdash; ${L("uptime")} <span>${uptime}</span> &mdash; <a href="/calendar" style="color:#94a3b8">${L("calendar")}</a> &mdash; <a href="/settings" style="color:#94a3b8">${L("settings")}</a> &mdash; <a href="/log" style="color:#94a3b8">${L("log")}</a> &mdash; <a href="/wifi" style="color:#94a3b8">${L("wifi")}</a> &mdash; <a href="#" style="color:#94a3b8" onclick="doRestart();return false">${L("restart")}</a></div>`;
+<div id="bar-uptime" class="uptime">${L("started")} <span>${startDate.toLocaleDateString(LOCALE.langCode)} ${formatTimeHM(startDate)}</span> &mdash; ${L("uptime")} <span>${uptime}</span> &mdash; <a href="/calendar" style="color:#94a3b8">${L("calendar")}</a> &mdash; <a href="/doors" style="color:#94a3b8">${L("doorsHistory")}</a> &mdash; <a href="/settings" style="color:#94a3b8">${L("settings")}</a> &mdash; <a href="/log" style="color:#94a3b8">${L("log")}</a> &mdash; <a href="/wifi" style="color:#94a3b8">${L("wifi")}</a> &mdash; <a href="#" style="color:#94a3b8" onclick="doRestart();return false">${L("restart")}</a></div>`;
 }
 
 function buildDashboardHtml(status: StatusResponse, stats?: StatsSnapshot, ledMode?: string,
@@ -4496,6 +4666,355 @@ function getAvailableLocales(): { id: string; label: string }[] {
     return result;
 }
 
+// ---- Door History Page ----
+
+const DOORS_PAGE_CSS = `
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+         background: #0f172a; color: #e2e8f0; padding: 24px; max-width: 800px; margin: 0 auto; }
+  h1 { font-size: 1.4rem; font-weight: 600; margin-bottom: 16px; color: #94a3b8; }
+  .toolbar { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-bottom: 16px; }
+  .toolbar label { color: #94a3b8; font-size: 0.85rem; }
+  .toolbar select { padding: 6px 10px; border-radius: 6px; border: 1px solid #475569;
+       background: #1e293b; color: #e2e8f0; font-size: 0.85rem; }
+  .view-tabs { display: flex; gap: 4px; margin-left: auto; }
+  .view-tabs a { padding: 6px 14px; border-radius: 6px; text-decoration: none; color: #94a3b8;
+       font-size: 0.85rem; background: #1e293b; border: 1px solid #334155; }
+  .view-tabs a.active { background: #334155; color: #f8fafc; border-color: #475569; }
+  .nav { display: flex; align-items: center; gap: 16px; margin-bottom: 16px; }
+  .nav a { color: #94a3b8; text-decoration: none; font-size: 1.2rem; }
+  .nav a.disabled { opacity: 0.3; pointer-events: none; }
+  .nav .title { flex: 1; text-align: center; font-size: 1rem; font-weight: 600; }
+  .card { background: #1e293b; border-radius: 10px; padding: 16px; margin-bottom: 12px; }
+  table { width: 100%; border-collapse: collapse; }
+  td, th { padding: 6px 8px; text-align: left; }
+  th { color: #64748b; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  .val { color: #f8fafc; font-weight: 600; }
+  .muted { color: #64748b; }
+  .day-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 8px; margin-bottom: 12px; }
+  .day-cell { background: #1e293b; border-radius: 8px; padding: 10px 8px; text-align: center;
+       min-height: 70px; border: 1px solid #334155; }
+  .day-cell.today { border-color: #3b82f6; }
+  .day-cell .num { font-size: 0.85rem; font-weight: 600; margin-bottom: 4px; }
+  .day-cell .stat { font-size: 0.75rem; color: #94a3b8; }
+  .day-cell a { color: inherit; text-decoration: none; }
+  a { color: #94a3b8; }
+  .footer { margin-top: 16px; }
+  .open-row { color: #f59e0b; }
+`;
+
+function doorsPageHeader(doorIds: number[], selectedDoor: string,
+    currentView: string, anchorDate: string): string {
+    const doorOpts = doorIds.map(id => {
+        const name = DOOR_NAMES[String(id)] || `Sensor ${id}`;
+        const sel = String(id) === selectedDoor ? " selected" : "";
+        return `<option value="${id}"${sel}>${name}</option>`;
+    }).join("\n        ");
+    const allSel = selectedDoor === "all" ? " selected" : "";
+    const viewLink = (v: string, label: string) => {
+        const cls = v === currentView ? ' class="active"' : "";
+        return `<a href="/doors?view=${v}&date=${anchorDate}&door=${selectedDoor}"${cls}>${label}</a>`;
+    };
+    return `<div class="toolbar">
+  <span>
+    <label>Door:</label>
+    <select onchange="location.href='/doors?view=${currentView}&date=${anchorDate}&door='+this.value">
+        <option value="all"${allSel}>${L("doorsAllDoors")}</option>
+        ${doorOpts}
+    </select>
+  </span>
+  <div class="view-tabs">
+    ${viewLink("day", L("doorsDay"))}
+    ${viewLink("week", L("doorsWeek"))}
+    ${viewLink("month", L("doorsMonth"))}
+  </div>
+</div>`;
+}
+
+function buildDoorsDayHtml(
+    daySummaries: DoorDaySummary[],
+    date: string,
+    oldestDate: string,
+    latestDate: string,
+    doorIds: number[],
+    selectedDoor: string
+): string {
+    const prevDate = new Date(date + "T12:00:00");
+    prevDate.setDate(prevDate.getDate() - 1);
+    const nextDate = new Date(date + "T12:00:00");
+    nextDate.setDate(nextDate.getDate() + 1);
+    const prevStr = fmtDate(prevDate);
+    const nextStr = fmtDate(nextDate);
+    const canPrev = prevStr >= oldestDate;
+    const canNext = nextStr <= latestDate;
+
+    // Merge events from all matching summaries, sorted by time
+    const allEvents: (PersistedDoorEvent & { name: string })[] = [];
+    let totalOpens = 0;
+    let totalSeconds = 0;
+    for (const s of daySummaries) {
+        totalOpens += s.openCount;
+        totalSeconds += s.totalOpenSeconds;
+        for (const ev of s.events) {
+            allEvents.push({ ...ev, name: s.name });
+        }
+    }
+    allEvents.sort((a, b) => a.time - b.time);
+
+    let eventRows = "";
+    if (allEvents.length === 0) {
+        eventRows = `<tr><td colspan="4" class="muted">${L("doorsNoEvents")}</td></tr>`;
+    } else {
+        for (const ev of allEvents) {
+            const timeStr = formatClockHMS(ev.time);
+            const typeStr = ev.type === "open"
+                ? (ev.openSeconds === DOOR_STILL_OPEN_SENTINEL
+                    ? `<span class="open-row">${L("doorStillOpen")}</span>`
+                    : `${L("doorOpenDuration", { duration: `${ev.openSeconds}s` })}`)
+                : L("doorClosed");
+            const nameCol = selectedDoor === "all" ? `<td>${ev.name}</td>` : "";
+            eventRows += `<tr>${nameCol}<td>${timeStr}</td><td>${typeStr}</td></tr>\n`;
+        }
+    }
+
+    const nameHeader = selectedDoor === "all" ? `<th>Door</th>` : "";
+    const lastBat = daySummaries.find(s => s.lastBatteryMv !== undefined)?.lastBatteryMv;
+
+    return `<!DOCTYPE html>
+<html lang="${LOCALE.langCode}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${L("doorsHistoryTitle")}</title>
+<style>${DOORS_PAGE_CSS}</style>
+</head>
+<body>
+<h1>${L("doorsHistoryTitle")}</h1>
+${doorsPageHeader(doorIds, selectedDoor, "day", date)}
+<div class="nav">
+  <a href="/doors?date=${prevStr}&door=${selectedDoor}" class="${canPrev ? "" : "disabled"}">&larr;</a>
+  <div class="title">${date}</div>
+  <a href="/doors?date=${nextStr}&door=${selectedDoor}" class="${canNext ? "" : "disabled"}">&rarr;</a>
+</div>
+<div class="card">
+  <table>
+    <tr><td>${L("doorsOpenCount")}</td><td class="val">${totalOpens}</td>
+        <td>${L("doorsTotalTime")}</td><td class="val">${formatDuration(totalSeconds * 1000)}</td>
+        <td>${L("doorBattery")}</td><td class="val">${batteryIcon(lastBat)}</td></tr>
+  </table>
+</div>
+<div class="card">
+  <table>
+    <tr>${nameHeader}<th>${L("doorsTime")}</th><th>${L("doorsDuration")}</th></tr>
+    ${eventRows}
+  </table>
+</div>
+<p class="footer"><a href="/">${L("doorsBackToDashboard")}</a></p>
+</body>
+</html>`;
+}
+
+function buildDoorsWeekHtml(
+    allDays: readonly DoorDaySummary[],
+    anchorDate: string,
+    oldestDate: string,
+    latestDate: string,
+    doorIds: number[],
+    selectedDoor: string
+): string {
+    const sunday = weekSunday(anchorDate);
+    const dayNames = [L("daySun"), L("dayMon"), L("dayTue"), L("dayWed"), L("dayThu"), L("dayFri"), L("daySat")];
+    const todayStr = fmtDate(new Date());
+
+    // Build map: date → aggregated counts
+    const dayMap = new Map<string, { opens: number; seconds: number; battery?: number }>();
+    for (const d of allDays) {
+        if (selectedDoor !== "all" && d.doorId !== parseInt(selectedDoor, 10)) { continue; }
+        const existing = dayMap.get(d.date) || { opens: 0, seconds: 0 };
+        existing.opens += d.openCount;
+        existing.seconds += d.totalOpenSeconds;
+        if (d.lastBatteryMv !== undefined) { existing.battery = d.lastBatteryMv; }
+        dayMap.set(d.date, existing);
+    }
+
+    const prevSunday = new Date(sunday);
+    prevSunday.setDate(sunday.getDate() - 7);
+    const nextSunday = new Date(sunday);
+    nextSunday.setDate(sunday.getDate() + 7);
+    const canPrev = fmtDate(new Date(sunday.getTime() - 86400000)) >= oldestDate;
+    const canNext = fmtDate(nextSunday) <= latestDate;
+
+    let totalOpens = 0;
+    let totalSeconds = 0;
+    let maxOpens = 1;
+    const weekDays: { dateStr: string; dayName: string; dayNum: number; data?: { opens: number; seconds: number; battery?: number }; isToday: boolean }[] = [];
+    for (let i = 0; i < 7; i++) {
+        const dt = new Date(sunday);
+        dt.setDate(sunday.getDate() + i);
+        const ds = fmtDate(dt);
+        const data = dayMap.get(ds);
+        weekDays.push({ dateStr: ds, dayName: dayNames[i], dayNum: dt.getDate(), data, isToday: ds === todayStr });
+        if (data) {
+            totalOpens += data.opens;
+            totalSeconds += data.seconds;
+            maxOpens = Math.max(maxOpens, data.opens);
+        }
+    }
+
+    let dayCells = "";
+    for (const wd of weekDays) {
+        const border = wd.isToday ? "border-color:#3b82f6" : "";
+        const opens = wd.data?.opens ?? 0;
+        const barH = Math.round((opens / maxOpens) * 40);
+        const bat = wd.data?.battery !== undefined ? ` ${batteryIcon(wd.data.battery)}` : "";
+        dayCells += `<div class="day-cell${wd.isToday ? " today" : ""}" style="${border}">
+  <a href="/doors?date=${wd.dateStr}&door=${selectedDoor}">
+    <div class="num">${wd.dayName} ${wd.dayNum}</div>
+    <div style="height:${barH}px;background:#3b82f6;border-radius:3px;margin:4px auto;width:60%"></div>
+    <div class="stat">${opens > 0 ? `${opens} opens` : "--"}</div>
+    <div class="stat">${opens > 0 ? formatDuration(wd.data!.seconds * 1000) : ""}${bat}</div>
+  </a>
+</div>`;
+    }
+
+    const monthNames = (L("monthNames")).split(",");
+    const firstMonth = new Date(sunday);
+    const lastDay = new Date(sunday);
+    lastDay.setDate(sunday.getDate() + 6);
+    const title = firstMonth.getMonth() === lastDay.getMonth()
+        ? `${monthNames[firstMonth.getMonth()]} ${firstMonth.getFullYear()}`
+        : `${monthNames[firstMonth.getMonth()]} / ${monthNames[lastDay.getMonth()]} ${firstMonth.getFullYear()}`;
+
+    return `<!DOCTYPE html>
+<html lang="${LOCALE.langCode}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${L("doorsHistoryTitle")}</title>
+<style>${DOORS_PAGE_CSS}</style>
+</head>
+<body>
+<h1>${L("doorsHistoryTitle")}</h1>
+${doorsPageHeader(doorIds, selectedDoor, "week", anchorDate)}
+<div class="nav">
+  <a href="/doors?view=week&date=${fmtDate(prevSunday)}&door=${selectedDoor}" class="${canPrev ? "" : "disabled"}">&larr;</a>
+  <div class="title">${title}</div>
+  <a href="/doors?view=week&date=${fmtDate(nextSunday)}&door=${selectedDoor}" class="${canNext ? "" : "disabled"}">&rarr;</a>
+</div>
+<div class="day-grid">${dayCells}</div>
+<div class="card">
+  <table>
+    <tr><td>${L("doorsOpenCount")}</td><td class="val">${totalOpens}</td>
+        <td>${L("doorsTotalTime")}</td><td class="val">${formatDuration(totalSeconds * 1000)}</td></tr>
+  </table>
+</div>
+<p class="footer"><a href="/">${L("doorsBackToDashboard")}</a></p>
+</body>
+</html>`;
+}
+
+function buildDoorsMonthHtml(
+    allDays: readonly DoorDaySummary[],
+    anchorDate: string,
+    oldestDate: string,
+    latestDate: string,
+    doorIds: number[],
+    selectedDoor: string
+): string {
+    const monthNames = (L("monthNames")).split(",");
+    const dayNames = [L("daySun"), L("dayMon"), L("dayTue"), L("dayWed"), L("dayThu"), L("dayFri"), L("daySat")];
+    const todayStr = fmtDate(new Date());
+    const anchor = new Date(anchorDate + "T12:00:00");
+    const year = anchor.getFullYear();
+    const month = anchor.getMonth();
+
+    // Build map
+    const dayMap = new Map<string, { opens: number; seconds: number; battery?: number }>();
+    for (const d of allDays) {
+        if (selectedDoor !== "all" && d.doorId !== parseInt(selectedDoor, 10)) { continue; }
+        const existing = dayMap.get(d.date) || { opens: 0, seconds: 0 };
+        existing.opens += d.openCount;
+        existing.seconds += d.totalOpenSeconds;
+        if (d.lastBatteryMv !== undefined) { existing.battery = d.lastBatteryMv; }
+        dayMap.set(d.date, existing);
+    }
+
+    // Navigation
+    const prevMonth = new Date(year, month - 1, 1);
+    const nextMonth = new Date(year, month + 1, 1);
+    const canPrev = fmtDate(prevMonth) >= oldestDate.slice(0, 7) + "-01";
+    const canNext = fmtDate(nextMonth) <= latestDate;
+
+    // Calendar grid
+    const firstDay = new Date(year, month, 1);
+    const startDow = firstDay.getDay(); // 0=Sun
+    const daysInMonth = new Date(year, month + 1, 0).getDate();
+
+    let maxOpens = 1;
+    let totalOpens = 0;
+    let totalSeconds = 0;
+    for (let d = 1; d <= daysInMonth; d++) {
+        const ds = `${year}-${String(month + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+        const data = dayMap.get(ds);
+        if (data) {
+            maxOpens = Math.max(maxOpens, data.opens);
+            totalOpens += data.opens;
+            totalSeconds += data.seconds;
+        }
+    }
+
+    // Header row
+    let headerCells = "";
+    for (const dn of dayNames) { headerCells += `<div class="day-cell" style="min-height:auto;padding:6px;background:transparent;border:none"><div class="stat">${dn}</div></div>`; }
+
+    // Day cells
+    let cells = "";
+    // Empty cells for padding
+    for (let i = 0; i < startDow; i++) { cells += `<div class="day-cell" style="opacity:0.3"></div>`; }
+    for (let d = 1; d <= daysInMonth; d++) {
+        const ds = `${year}-${String(month + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+        const data = dayMap.get(ds);
+        const isToday = ds === todayStr;
+        const opens = data?.opens ?? 0;
+        const barH = Math.round((opens / maxOpens) * 30);
+        cells += `<div class="day-cell${isToday ? " today" : ""}">
+  <a href="/doors?date=${ds}&door=${selectedDoor}">
+    <div class="num">${d}</div>
+    ${opens > 0 ? `<div style="height:${barH}px;background:#3b82f6;border-radius:2px;margin:2px auto;width:50%"></div>` : ""}
+    <div class="stat">${opens > 0 ? `${opens}` : ""}</div>
+  </a>
+</div>`;
+    }
+
+    return `<!DOCTYPE html>
+<html lang="${LOCALE.langCode}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${L("doorsHistoryTitle")}</title>
+<style>${DOORS_PAGE_CSS}</style>
+</head>
+<body>
+<h1>${L("doorsHistoryTitle")}</h1>
+${doorsPageHeader(doorIds, selectedDoor, "month", anchorDate)}
+<div class="nav">
+  <a href="/doors?view=month&date=${fmtDate(prevMonth)}&door=${selectedDoor}" class="${canPrev ? "" : "disabled"}">&larr;</a>
+  <div class="title">${monthNames[month]} ${year}</div>
+  <a href="/doors?view=month&date=${fmtDate(nextMonth)}&door=${selectedDoor}" class="${canNext ? "" : "disabled"}">&rarr;</a>
+</div>
+<div class="day-grid">${headerCells}</div>
+<div class="day-grid">${cells}</div>
+<div class="card">
+  <table>
+    <tr><td>${L("doorsOpenCount")}</td><td class="val">${totalOpens}</td>
+        <td>${L("doorsTotalTime")}</td><td class="val">${formatDuration(totalSeconds * 1000)}</td></tr>
+  </table>
+</div>
+<p class="footer"><a href="/">${L("doorsBackToDashboard")}</a></p>
+</body>
+</html>`;
+}
+
 function saveConfig(updates: Partial<FlowConfig>): void {
     let cfg: FlowConfig = {};
     if (existsSync(CONFIG_FILE)) {
@@ -4610,6 +5129,12 @@ ${savedBanner}
     <label>${L("settingLocale")}</label>
     <select name="locale">
       ${localeOptions}
+    </select>
+
+    <label>${L("settingTimeFormat")}</label>
+    <select name="timeFormat">
+      <option value="24"${TIME_FORMAT === "24" ? " selected" : ""}>${L("settingTime24")}</option>
+      <option value="12"${TIME_FORMAT === "12" ? " selected" : ""}>${L("settingTime12")}</option>
     </select>
 
     <label>${L("settingTempUnits")}</label>
@@ -5973,6 +6498,33 @@ class FlowHttpServer {
                 break;
             }
 
+            case "/doors": {
+                const dateParam = parsed.searchParams.get("date") ?? undefined;
+                const viewParam = parsed.searchParams.get("view") ?? undefined;
+                const doorParam = parsed.searchParams.get("door") ?? "all";
+                const todayStr = dateString();
+                const allDoorDays = this.sensors.doorHistoryStore.getAllDays();
+                const doorIds = this.sensors.doorHistoryStore.getDoorIds();
+                const dates = allDoorDays.map(d => d.date);
+                const oldestDate = dates.length > 0 ? dates.reduce((a, b) => a < b ? a : b) : todayStr;
+                const latestDate = todayStr;
+                let requestDate = dateParam || todayStr;
+                if (requestDate > latestDate) { requestDate = latestDate; }
+                if (requestDate < oldestDate) { requestDate = oldestDate; }
+
+                if (viewParam === "month") {
+                    this.sendHtml(res, buildDoorsMonthHtml(allDoorDays, requestDate, oldestDate, latestDate, doorIds, doorParam));
+                } else if (viewParam === "week") {
+                    this.sendHtml(res, buildDoorsWeekHtml(allDoorDays, requestDate, oldestDate, latestDate, doorIds, doorParam));
+                } else {
+                    const daySummaries = doorParam === "all"
+                        ? this.sensors.doorHistoryStore.getDay(requestDate)
+                        : this.sensors.doorHistoryStore.getDay(requestDate, parseInt(doorParam, 10));
+                    this.sendHtml(res, buildDoorsDayHtml(daySummaries, requestDate, oldestDate, latestDate, doorIds, doorParam));
+                }
+                break;
+            }
+
             default:
                 this.sendJson(res, 404, { error: "not found" });
                 break;
@@ -6055,6 +6607,9 @@ class FlowHttpServer {
 
             const locale = params.get("locale");
             if (locale) { updates.locale = locale; }
+
+            const timeFormat = params.get("timeFormat");
+            if (timeFormat === "12" || timeFormat === "24") { updates.timeFormat = timeFormat; }
 
             const tempUnits = params.get("tempUnits");
             if (tempUnits === "C" || tempUnits === "F") { updates.tempUnits = tempUnits; }
