@@ -292,6 +292,7 @@ const DEFAULT_LOCALE: LocaleStrings = {
     log: "Log", logTitle: "System Log", logBackToDashboard: "Back to dashboard",
     logEmpty: "No log entries.", logFilter: "Level:", logArea: "Area:", logFilterAll: "All",
     logFilterInfo: "Info and above", logFilterImportant: "Important and above",
+    logDate: "Date:", logDateCurrent: "Current session", logDateToday: "Today",
     restart: "Restart",
     restartConfirm: "Restart the system? The dashboard will be unavailable for a few seconds.",
     restartMessage: "Restarting...",
@@ -635,6 +636,40 @@ class ActivityLogger {
             summary.heaterEnergyKwh !== undefined ? `heaterEnergy=${formatEnergy(summary.heaterEnergyKwh)}` : "",
         ].filter(Boolean).join(" ");
         this.writeLine("DAILY", `flow=${formatVolume(summary.flowLiters)} pump=${summary.pumpOnMinutes.toFixed(0)}min ${temps}${energy ? " " + energy : ""}`);
+    }
+
+    /** List available log dates (from rotated files), most recent first. */
+    public getAvailableDates(): string[] {
+        try {
+            return readdirSync(this.logDir)
+                .filter((f) => /^flow_\d{4}-\d{2}-\d{2}\.log$/.test(f))
+                .map((f) => f.slice(5, -4))  // extract YYYY-MM-DD
+                .sort()
+                .reverse();
+        } catch {
+            return [];
+        }
+    }
+
+    /** Read a rotated log file by date. Returns empty string if not found. */
+    public readLogByDate(date: string): string {
+        // Validate date format to prevent path traversal
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) { return ""; }
+        const path = join(this.logDir, `flow_${date}.log`);
+        try {
+            return existsSync(path) ? readFileSync(path, "utf-8") : "";
+        } catch {
+            return "";
+        }
+    }
+
+    /** Read the current (active) log file. */
+    public readCurrentLog(): string {
+        try {
+            return existsSync(this.logPath) ? readFileSync(this.logPath, "utf-8") : "";
+        } catch {
+            return "";
+        }
     }
 
     public rotateLogs(): void {
@@ -3134,12 +3169,15 @@ ${buildThermometerSvg(560, 100, hotC, L("thermHot"), "therm-hot")}
 </svg>`;
 }
 
-function buildLogHtml(): string {
+function buildLogHtml(availableDates: string[]): string {
     const lines = logger.fullLog(LogSeverity.Detail);
     const escaped = lines
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;");
+    const dateOptions = availableDates.map(d =>
+        `      <option value="${d}">${d}</option>`
+    ).join("\n");
     return `<!DOCTYPE html>
 <html lang="${LOCALE.langCode}">
 <head>
@@ -3158,8 +3196,6 @@ function buildLogHtml(): string {
   .log-container { background: #1e293b; border-radius: 10px; padding: 16px; overflow-x: auto; }
   pre { font-family: "SF Mono", "Menlo", "Monaco", "Courier New", monospace;
         font-size: 0.8rem; line-height: 1.5; color: #cbd5e1; white-space: pre-wrap; word-break: break-all; }
-  .log-line { }
-  .log-line.hidden { display: none; }
   a { color: #94a3b8; }
   .footer { margin-top: 16px; }
 </style>
@@ -3167,6 +3203,14 @@ function buildLogHtml(): string {
 <body>
 <h1>${L("logTitle")}</h1>
 <div class="filter-bar">
+  <span>
+    <label for="logdate">${L("logDate")}</label>
+    <select id="logdate" onchange="switchDate()">
+      <option value="current">${L("logDateCurrent")}</option>
+      <option value="${dateString()}">${L("logDateToday")}</option>
+${dateOptions}
+    </select>
+  </span>
   <span>
     <label for="severity">${L("logFilter")}</label>
     <select id="severity" onchange="applyFilter()">
@@ -3196,6 +3240,7 @@ function buildLogHtml(): string {
 var logPre = document.getElementById("log-pre");
 var rawText = "";
 var lastRawLen = 0;
+var refreshTimer = null;
 
 function escapeHtml(s) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -3224,7 +3269,9 @@ function applyFilter() {
 }
 
 function refreshLog() {
-  fetch("/api/log").then(function(r) { return r.text(); }).then(function(text) {
+  var dateVal = document.getElementById("logdate").value;
+  var url = dateVal === "current" ? "/api/log" : "/api/log?date=" + dateVal;
+  fetch(url).then(function(r) { return r.text(); }).then(function(text) {
     if (text.length !== lastRawLen) {
       lastRawLen = text.length;
       rawText = text;
@@ -3233,10 +3280,22 @@ function refreshLog() {
   }).catch(function() {});
 }
 
+function switchDate() {
+  var dateVal = document.getElementById("logdate").value;
+  lastRawLen = 0;
+  rawText = "";
+  refreshLog();
+  // Only auto-refresh for current session and today's log
+  if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
+  if (dateVal === "current" || dateVal === "${dateString()}") {
+    refreshTimer = setInterval(refreshLog, 5000);
+  }
+}
+
 // Initialize from server-rendered content
 rawText = logPre.textContent || "";
 lastRawLen = rawText.length;
-setInterval(refreshLog, 5000);
+refreshTimer = setInterval(refreshLog, 5000);
 </script>
 </body>
 </html>`;
@@ -5719,7 +5778,7 @@ class FlowHttpServer {
         const parsed = new URL(req.url || "/", "http://localhost");
         const path = parsed.pathname;
 
-        logger.log(LogSeverity.Detail, LogArea.Server, `${req.method} ${path}`);
+        // logger.log(LogSeverity.Detail, LogArea.Server, `${req.method} ${path}`);
 
         // Captive portal detection: redirect to WiFi setup page when AP is active.
         // Devices probe known URLs to detect captive portals.
@@ -5792,7 +5851,26 @@ class FlowHttpServer {
                 break;
 
             case "/api/log": {
-                const logText = logger.fullLog(LogSeverity.Detail);
+                const dateParam = parsed.searchParams.get("date");
+                let logText: string;
+                if (!dateParam || dateParam === "current") {
+                    logText = logger.fullLog(LogSeverity.Detail);
+                } else if (/^\d{4}-\d{2}-\d{2}$/.test(dateParam)) {
+                    // Read historical logs from journalctl
+                    try {
+                        const nextDay = new Date(dateParam + "T00:00:00");
+                        nextDay.setDate(nextDay.getDate() + 1);
+                        const nextStr = nextDay.toISOString().slice(0, 10);
+                        logText = execSync(
+                            `journalctl -u flow-server --since "${dateParam}" --until "${nextStr}" --no-pager -o short-iso 2>/dev/null || true`,
+                            { timeout: 10000, stdio: "pipe", maxBuffer: 10 * 1024 * 1024 },
+                        ).toString();
+                    } catch {
+                        logText = "";
+                    }
+                } else {
+                    logText = "";
+                }
                 this.sendText(res, logText);
                 break;
             }
@@ -5829,9 +5907,22 @@ class FlowHttpServer {
                 this.sendJson(res, 200, this.sensors.getPump());
                 break;
 
-            case "/log":
-                this.sendHtml(res, buildLogHtml());
+            case "/log": {
+                let dates: string[] = [];
+                try {
+                    // Get dates that have journal entries for flow-server
+                    const output = execSync(
+                        `journalctl -u flow-server --no-pager -o short-iso 2>/dev/null | grep -oP '^\\d{4}-\\d{2}-\\d{2}' | sort -u | tac || true`,
+                        { timeout: 10000, stdio: "pipe" },
+                    ).toString().trim();
+                    if (output) { dates = output.split("\n"); }
+                } catch { /* fall back to empty */ }
+                // Remove today from the list — "Current" covers today
+                const today = dateString();
+                dates = dates.filter(d => d !== today);
+                this.sendHtml(res, buildLogHtml(dates));
                 break;
+            }
 
             case "/settings":
                 this.sendHtml(res, buildSettingsHtml());
